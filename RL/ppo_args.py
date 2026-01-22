@@ -52,13 +52,13 @@ def add_ppo_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         default=100,
         help='Number of training epochs'
     )
-    parser.add_argument(
-        '--downsample_ratio',
-        type=int,
-        default=4,
-        help='Downsample ratio for actual states during training (default: 1, no downsampling). '
-             'If > 1, every Nth state is kept. Complete trajectory is used for evaluation and visualization.'
-    )
+    # parser.add_argument(
+    #     '--downsample_ratio',
+    #     type=int,
+    #     default=4,
+    #     help='Downsample ratio for actual states during training (default: 1, no downsampling). '
+    #          'If > 1, every Nth state is kept. Complete trajectory is used for evaluation and visualization.'
+    # )
     parser.add_argument(
         '--learning_rate',
         type=float,
