@@ -380,50 +380,22 @@ class ActorNetwork(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.2,
         deterministic: bool = False,
-        action_history_len: int = 20
+        time_scale: float = 100.0
     ):
         super(ActorNetwork, self).__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.deterministic = deterministic
-        self.action_history_len = action_history_len
+        self.time_scale = float(time_scale)
         
-        # Process actual trajectory
-        self.traj_proj = nn.Linear(state_dim, hidden_dim)
-        self.traj_lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        
-        # Process current state
-        self.state_proj = nn.Linear(state_dim, hidden_dim)
-        
-        # Process action history with transformer
-        self.action_proj = nn.Linear(action_dim, hidden_dim)
-        # Positional encoding for transformer (learnable)
-        self.action_pos_encoding = nn.Parameter(torch.randn(1, action_history_len, hidden_dim))
-        
-        # Transformer encoder for action history
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=8,
-            dim_feedforward=hidden_dim * 2,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.action_transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=2
-        )
-        
-        # Combine trajectory context, state, and action history
-        # Input: traj_context (hidden_dim) + state_encoded (hidden_dim) + action_context (hidden_dim) = 3*hidden_dim
+        # Actor now only conditions on (current_state, current_time_index).
+        # We augment the current state with a (scaled) time index: [x, y, heading, v, t_norm]
+        self.state_time_proj = nn.Linear(state_dim + 1, hidden_dim)
+
+        # Shared network
         self.shared_net = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -435,77 +407,70 @@ class ActorNetwork(nn.Module):
         self.mean_head = nn.Linear(hidden_dim // 2, action_dim)
         self.log_std_head = nn.Linear(hidden_dim // 2, action_dim)
         
-        # Log std bounds
-        self.log_std_min = -20
-        self.log_std_max = 2
+        # Initialize log_std_head to output reasonable initial variance
+        # Initialize bias to -1.0 so initial std ≈ 0.37 (good for exploration)
+        # Initialize weights to small values to prevent large initial variance
+        nn.init.constant_(self.log_std_head.bias, -1.0)
+        nn.init.normal_(self.log_std_head.weight, mean=0.0, std=0.01)
+        
+        # Log std bounds: prevent std from being too small (min std ≈ 0.01) or too large (max std ≈ 7.4)
+        # This ensures the policy maintains some exploration while preventing extreme values
+        self.log_std_min = -4.6  # exp(-4.6) ≈ 0.01 (minimum reasonable std)
+        self.log_std_max = 2.0   # exp(2.0) ≈ 7.4 (maximum reasonable std)
     
     def forward(
         self,
-        actual_trajectory: torch.Tensor,
         current_state: torch.Tensor,
-        action_history: torch.Tensor = None
+        current_time_index: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.
         
         Args:
-            actual_trajectory: [batch_size, seq_len, state_dim]
-            current_state: [batch_size, state_dim]
-            action_history: [batch_size, action_history_len, action_dim] previous executed actions
-                           If None, uses zeros (no action history)
+            current_state: [batch_size, state_dim] or [state_dim] (single state without batch)
+            current_time_index: [batch_size] or scalar time index of current state
+                              If None, uses 0 for all
         
         Returns:
-            mean: [batch_size, action_dim]
-            log_std: [batch_size, action_dim]
+            mean: [batch_size, action_dim] or [action_dim] (if input was single state)
+            log_std: [batch_size, action_dim] or [action_dim] (if input was single state)
         """
-        batch_size = actual_trajectory.shape[0]
-        device = actual_trajectory.device
+        device = current_state.device
         
-        # Process actual trajectory
-        traj_proj = self.traj_proj(actual_trajectory)  # [batch, seq_len, hidden_dim]
-        traj_lstm, _ = self.traj_lstm(traj_proj)  # [batch, seq_len, hidden_dim]
-        traj_context = traj_lstm[:, -1, :]  # [batch, hidden_dim]
+        # Normalize current_state to have batch dimension
+        current_state_has_batch = len(current_state.shape) == 2
+        current_state = current_state.unsqueeze(0) if not current_state_has_batch else current_state
+        batch_size_current = current_state.shape[0]
         
-        # Process current state
-        state_encoded = self.state_proj(current_state)  # [batch, hidden_dim]
-        
-        # Process action history with transformer
-        if action_history is None:
-            # Use zeros if no action history provided
-            action_history = torch.zeros(batch_size, self.action_history_len, self.action_dim, device=device)
+        # Normalize current_time_index
+        if current_time_index is None:
+            current_time_index = torch.zeros(batch_size_current, device=device, dtype=torch.float32)
+        elif current_time_index.dim() == 0:
+            current_time_index = current_time_index.unsqueeze(0).expand(batch_size_current).float()
+        elif current_time_index.shape[0] != batch_size_current:
+            current_time_index = current_time_index.expand(batch_size_current).float()
         else:
-            # Ensure action_history has the right length (pad or truncate)
-            action_seq_len = action_history.shape[1]
-            if action_seq_len < self.action_history_len:
-                # Pad with zeros at the beginning
-                padding = torch.zeros(batch_size, self.action_history_len - action_seq_len, self.action_dim, device=device)
-                action_history = torch.cat([padding, action_history], dim=1)  # [batch, action_history_len, action_dim]
-            elif action_seq_len > self.action_history_len:
-                # Take the most recent actions
-                action_history = action_history[:, -self.action_history_len:, :]  # [batch, action_history_len, action_dim]
+            current_time_index = current_time_index.float()
         
-        # Project actions to hidden dimension
-        action_embeddings = self.action_proj(action_history)  # [batch, action_history_len, hidden_dim]
-        
-        # Add positional encoding (learnable)
-        # self.action_pos_encoding: [1, action_history_len, hidden_dim]
-        action_embeddings = action_embeddings + self.action_pos_encoding  # [batch, action_history_len, hidden_dim]
-        
-        # Process with transformer encoder
-        action_encoded = self.action_transformer(action_embeddings)  # [batch, action_history_len, hidden_dim]
-        
-        # Take the last output (most recent action context)
-        action_context = action_encoded[:, -1, :]  # [batch, hidden_dim]
-        
-        # Concatenate trajectory context, state, and action history context
-        combined = torch.cat([traj_context, state_encoded, action_context], dim=1)  # [batch, hidden_dim * 3]
-        
-        # Shared network
-        shared = self.shared_net(combined)  # [batch, hidden_dim // 2]
+        # Scale time index to a roughly [0, 1] range (avoid batch-dependent normalization).
+        # If your trajectories are ~90 steps, time_scale=100 is a reasonable default.
+        t_norm = current_time_index / max(self.time_scale, 1.0)
+
+        # Augment current state with time index: [batch, state_dim + 1]
+        current_state_augmented = torch.cat([current_state, t_norm.unsqueeze(-1)], dim=-1)
+
+        # Encode and predict
+        encoded = self.state_time_proj(current_state_augmented)  # [batch, hidden_dim]
+        shared = self.shared_net(encoded)  # [batch, hidden_dim // 2]
         
         # Mean and log_std
-        mean = self.mean_head(shared)  # [batch, action_dim]
-        log_std = self.log_std_head(shared)  # [batch, action_dim]
+        mean = self.mean_head(shared)  # [batch_size_current, action_dim]
+        log_std = self.log_std_head(shared)  # [batch_size_current, action_dim]
+        
+        # Remove batch dimension if it was added
+        if not current_state_has_batch and batch_size_current == 1:
+            mean = mean.squeeze(0)  # [action_dim]
+            log_std = log_std.squeeze(0)  # [action_dim]
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         
         # Clip mean to prevent extreme values and NaN
@@ -516,13 +481,12 @@ class ActorNetwork(nn.Module):
         mean = torch.where(torch.isnan(mean), torch.zeros_like(mean), mean)
         log_std = torch.where(torch.isnan(log_std), torch.zeros_like(log_std), log_std)
         
-        return mean, log_std
+        return mean, log_std 
     
     def sample(
         self,
-        actual_trajectory: torch.Tensor,
         current_state: torch.Tensor,
-        action_history: torch.Tensor = None
+        current_time_index: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample action from policy.
@@ -531,59 +495,55 @@ class ActorNetwork(nn.Module):
         Otherwise, samples from the normal distribution.
         
         Args:
-            actual_trajectory: [batch_size, seq_len, state_dim]
             current_state: [batch_size, state_dim]
-            action_history: [batch_size, action_history_len, action_dim] previous executed actions
-                           If None, uses zeros (no action history)
+            current_time_index: [batch_size] time index of current state
         
         Returns:
             action: [batch_size, action_dim]
             log_prob: [batch_size]
             mean: [batch_size, action_dim]
         """
-        mean, log_std = self.forward(actual_trajectory, current_state, action_history)
+        mean, log_std = self.forward(current_state, current_time_index)
+        
+        # Normalize mean and log_std to have batch dimension for consistent processing
+        from utils import ensure_batch_dim
+        mean_has_batch = len(mean.shape) == 2
+        mean = ensure_batch_dim(mean, 1) if not mean_has_batch else mean
+        log_std = ensure_batch_dim(log_std, 1) if not mean_has_batch else log_std
         
         # Ensure mean is valid
-        mean = torch.where(torch.isnan(mean), torch.zeros_like(mean), mean)
-        mean = torch.clamp(mean, min=-10.0, max=10.0)
-        
+        mean = torch.clamp(torch.where(torch.isnan(mean), torch.zeros_like(mean), mean), min=-10.0, max=10.0)
+        # Clamp mean to match action clamping rules:
+        #   - steering (index 0) in [-pi/3, pi/3]
+        #   - acceleration (index 1) in [-10, 10.0]
+        mean_clamped = mean.clone()
+        mean_clamped[:, 0] = torch.clamp(mean[:, 0], min=-torch.pi/3, max=torch.pi/3)  # steering
+        mean_clamped[:, 1] = torch.clamp(mean[:, 1], min=-5, max=5.0)               # acceleration
+        mean = mean_clamped
         # Sample action from policy
         if self.deterministic:
-            # Deterministic policy: return mean action directly
             action = mean
-            
-            # For log_prob in deterministic mode, use a very small std for numerical stability
-            # This allows PPO to still compute ratios, but action is essentially deterministic
             tiny_std = torch.ones_like(mean) * 1e-8
-            normal = Normal(mean, tiny_std)
-            log_prob = normal.log_prob(action).sum(dim=1)  # [batch]
+            log_prob = Normal(mean, tiny_std).log_prob(action).sum(dim=1)
         else:
-            # Stochastic policy: sample from normal distribution
-            std = torch.exp(log_std)
-            
-            # Ensure std is valid (no NaN or inf)
-            std = torch.clamp(std, min=1e-6, max=10.0)
-            std = torch.where(torch.isnan(std), torch.ones_like(std) * 0.1, std)
-            
-            # Sample from normal distribution
+            std = torch.clamp(torch.where(torch.isnan(torch.exp(log_std)), torch.ones_like(log_std) * 0.1, torch.exp(log_std)), min=1e-6, max=10.0)
             try:
                 normal = Normal(mean, std)
-                action = normal.rsample()  # Use rsample for reparameterization trick
-                
-                # Clip actions to reasonable bounds
-                action = torch.clamp(action, min=-10.0, max=10.0)
-                
-                # Compute log probability
-                log_prob = normal.log_prob(action)  # [batch, action_dim]
-                log_prob = log_prob.sum(dim=1)  # [batch]
-                
-                # Replace NaN log probs with a large negative value
-                log_prob = torch.where(torch.isnan(log_prob), torch.full_like(log_prob, -1e6), log_prob)
+                action = normal.rsample()
+                # Clamp actions such that acceleration (assumed index 1) >= 0.0001,
+                # and steering (assumed index 0) in [-pi/2, pi/2]
+                action_clamped = action.clone()
+                action_clamped[:, 0] = torch.clamp(action[:, 0], min=-torch.pi/3, max=torch.pi/3)  # steering
+                action_clamped[:, 1] = torch.clamp(action[:, 1], min=-5, max=5.0)            # acceleration
+                action = action_clamped
+                log_prob = torch.where(torch.isnan(normal.log_prob(action).sum(dim=1)), torch.full((mean.shape[0],), -1e6, device=mean.device), normal.log_prob(action).sum(dim=1))
             except Exception as e:
-                # Fallback: use mean as action if sampling fails
                 print(f"Warning: Sampling failed, using mean: {e}")
-                action = mean
-                log_prob = torch.zeros(mean.shape[0], device=mean.device)
+                action, log_prob = mean, torch.zeros(mean.shape[0], device=mean.device)
+        
+        # Remove batch dimension if it was added
+        if not mean_has_batch:
+            action, log_prob, mean = action.squeeze(0), log_prob.squeeze(0), mean.squeeze(0)
         
         return action, log_prob, mean
 
@@ -598,28 +558,20 @@ class ValueNetwork(nn.Module):
         state_dim: int = 4,
         hidden_dim: int = 128,
         num_layers: int = 2,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        time_scale: float = 100.0
     ):
         super(ValueNetwork, self).__init__()
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
+        self.time_scale = float(time_scale)
         
-        # Process actual trajectory
-        self.traj_proj = nn.Linear(state_dim, hidden_dim)
-        self.traj_lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        
-        # Process current state
-        self.state_proj = nn.Linear(state_dim, hidden_dim)
-        
-        # Combine and output value
+        # Critic now only conditions on (current_state, current_time_index).
+        self.state_time_proj = nn.Linear(state_dim + 1, hidden_dim)
+
+        # Output value
         self.value_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -630,31 +582,35 @@ class ValueNetwork(nn.Module):
     
     def forward(
         self,
-        actual_trajectory: torch.Tensor,
-        current_state: torch.Tensor
+        current_state: torch.Tensor,
+        current_time_index: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Forward pass.
         
         Args:
-            actual_trajectory: [batch_size, seq_len, state_dim]
             current_state: [batch_size, state_dim]
+            current_time_index: [batch_size] time index of current state
+                              If None, uses 0 for all
         
         Returns:
             Value: [batch_size, 1]
         """
-        # Process actual trajectory
-        traj_proj = self.traj_proj(actual_trajectory)  # [batch, seq_len, hidden_dim]
-        traj_lstm, _ = self.traj_lstm(traj_proj)  # [batch, seq_len, hidden_dim]
-        traj_context = traj_lstm[:, -1, :]  # [batch, hidden_dim]
-        
-        # Process current state
-        state_encoded = self.state_proj(current_state)  # [batch, hidden_dim]
-        
-        # Concatenate
-        combined = torch.cat([traj_context, state_encoded], dim=1)  # [batch, hidden_dim * 2]
-        
-        # Value
-        value = self.value_net(combined)  # [batch, 1]
+        device = current_state.device
+        batch_size = current_state.shape[0]
+
+        if current_time_index is None:
+            current_time_index = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        elif current_time_index.dim() == 0:
+            current_time_index = current_time_index.unsqueeze(0).expand(batch_size).float()
+        elif current_time_index.shape[0] != batch_size:
+            current_time_index = current_time_index.expand(batch_size).float()
+        else:
+            current_time_index = current_time_index.float()
+
+        t_norm = current_time_index / max(self.time_scale, 1.0)
+        current_state_augmented = torch.cat([current_state, t_norm.unsqueeze(-1)], dim=-1)  # [batch, state_dim+1]
+        encoded = self.state_time_proj(current_state_augmented)  # [batch, hidden_dim]
+        value = self.value_net(encoded)  # [batch, 1]
         
         return value

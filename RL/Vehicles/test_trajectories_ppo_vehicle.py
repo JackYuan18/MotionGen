@@ -57,17 +57,9 @@ def compute_trajectory_matching_error(
     actual_states = actual_states.to(device)
     
     # Use the curve fitting error from rewards function
-    with torch.no_grad():
-        # Expand to batch dimension for compute_reward
-        pred_batch = predicted_states.unsqueeze(0)  # [1, seq_len_pred, 4]
-        actual_batch = actual_states.unsqueeze(0)  # [1, seq_len_actual, 4]
-        
-        # Compute rewards (negative of errors)
-        step_rewards = compute_reward(pred_batch, actual_batch, actions=None)
-        
-        # Convert rewards to errors (negate and take mean)
-        step_errors = -step_rewards  # [1, seq_len_pred]
-        avg_error = step_errors.mean().item()
+    
+    mse = ((predicted_states[:,:2]  - actual_states[:,:2]) ** 2).mean(dim=-1)  # [1, seq_len_pred]
+    avg_error = mse.mean().item()  # Convert to scalar float
     
     return avg_error
 
@@ -110,15 +102,16 @@ def train_and_evaluate_trajectory(
     # Downsample actual_states for training if specified
     # The reward function can handle different sequence lengths without time alignment
     if downsample_ratio > 1:
-        actual_states = downsample_states(actual_states_complete, downsample_ratio)
+        actual_states, downsampled_indices = downsample_states(actual_states_complete, downsample_ratio)
         print(f"  Downsampling actual states: {actual_states_complete.shape[1]} -> {actual_states.shape[1]} (ratio={downsample_ratio})")
     else:
-        actual_states = actual_states_complete
-    
+        actual_states, downsampled_indices = downsample_states(actual_states_complete, downsample_ratio)
+        
     # Move to device
     initial_state = initial_state.to(device)
     actual_states = actual_states.to(device)
     actual_states_complete = actual_states_complete.to(device)
+    downsampled_indices = downsampled_indices.to(device)
     
     # Create actor and value networks
     actor = ActorNetwork(
@@ -144,18 +137,18 @@ def train_and_evaluate_trajectory(
     # Track best model
     best_loss = float('inf')
     best_epoch = 0
-    best_actor_state = None
-    best_value_state = None
-    
+    best_rollout_reward = float('-inf')
+    best_rollout_trajectory_saved = None
     train_losses = []
     
     # Training loop
     for epoch in range(args.num_epochs):
-        train_loss, _ = train_epoch_ppo(
+        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum = train_epoch_ppo(
             actor=actor,
             value_net=value_net,
             initial_state=initial_state,
             actual_states=actual_states,
+            downsampled_indices=downsampled_indices,
             actor_optimizer=actor_optimizer,
             value_optimizer=value_optimizer,
             device=device,
@@ -171,47 +164,32 @@ def train_and_evaluate_trajectory(
         
         train_losses.append(train_loss)
         
-        # Track best model
+        # Track best model based on training loss
         if train_loss < best_loss:
             best_loss = train_loss
             best_epoch = epoch + 1
-            best_actor_state = actor.state_dict().copy()
-            best_value_state = value_net.state_dict().copy()
         
-        if (epoch + 1) % 5 == 0:
-            print(f"  Epoch {epoch + 1}/{args.num_epochs}: Loss = {train_loss:.6f}")
-    
+        # Track best rollout trajectory based on reward sum
+        if best_rollout_reward_sum > best_rollout_reward:
+            best_rollout_reward = best_rollout_reward_sum
+            best_rollout_trajectory_saved = best_rollout_trajectory.clone() if isinstance(best_rollout_trajectory, torch.Tensor) else best_rollout_trajectory
+        
     print(f"  Best loss: {best_loss:.6f} at epoch {best_epoch}")
+    print(f"  Best rollout reward: {best_rollout_reward:.6f}")
     
-    # Load best model
-    actor.load_state_dict(best_actor_state)
-    value_net.load_state_dict(best_value_state)
-    actor.eval()
+    # Use the best rollout trajectory for evaluation
+    if best_rollout_trajectory_saved is None:
+        raise ValueError("No best rollout trajectory found. This should not happen.")
     
-    # Set actor to deterministic mode for evaluation (use mean actions)
-    original_deterministic = actor.deterministic
-    actor.deterministic = True
-    
-    # Evaluate with best model using deterministic mean actions
-    # Use complete trajectory for evaluation (not downsampled)
-    with torch.no_grad():
-        # Generate deterministic rollout using mean actions
-        # Use complete trajectory for state feedback during rollout
-        initial_state_batch = initial_state.repeat(1, 1)  # [1, 4]
-        actual_states_batch = actual_states_complete.repeat(1, 1, 1)  # [1, seq_len, 4]
-        
-        predicted_states, _, _ = rollout_trajectory_state_feedback(
-            actor=actor,
-            initial_state=initial_state_batch,
-            actual_trajectory=actual_states_batch,
-            seq_len=actual_states_complete.shape[1],
-            dt=args.dt
-        )
-        predicted_states = predicted_states[0].cpu()  # [seq_len, 4]
-        actual_states_cpu = actual_states_complete[0].cpu()  # [seq_len, 4]
+    # Handle tensor shape: best_rollout_trajectory_saved is [seq_len, 4] (already on CPU from train_epoch_ppo)
+    if isinstance(best_rollout_trajectory_saved, torch.Tensor):
+        predicted_states = best_rollout_trajectory_saved.cpu()  # [seq_len, 4]
+    else:
+        predicted_states = torch.from_numpy(best_rollout_trajectory_saved).cpu()  # [seq_len, 4]
+    actual_states_cpu = actual_states_complete[0].cpu()  # [seq_len, 4]
     
     # Restore original deterministic setting
-    actor.deterministic = original_deterministic
+  
         
     # Compute matching error using complete trajectory
     matching_error = compute_trajectory_matching_error(
@@ -251,6 +229,7 @@ def train_and_evaluate_trajectory(
     return {
         'trajectory_index': traj_idx,
         'best_loss': best_loss,
+        'best_rollout_reward': best_rollout_reward,
         'best_epoch': best_epoch,
         'matching_error': matching_error,
         'final_loss': train_losses[-1] if train_losses else float('inf'),
@@ -283,7 +262,7 @@ def main():
         '--downsample_ratio',
         type=int,
         nargs='+',
-        default=[5],
+        default=[5,10,15,20],
         help='Downsample ratio(s) for actual states during training. Can be a single value or a list. '
              'If multiple values provided, test will run for each ratio separately.'
     )
@@ -333,7 +312,7 @@ def main():
         state_dim=4,
         dt=0.1
     )
-    states = states[:5]
+
     print(f"States shape: {states.shape}")
     
     # Train and evaluate each trajectory
@@ -353,11 +332,11 @@ def main():
             results.append(result)
          
     # Create test_results directory
-        test_results_dir = 'test_results'
+        test_results_dir = 'vehicle_test_results'
         os.makedirs(test_results_dir, exist_ok=True)
         # Generate output filename based on downsample ratio
 
-        output_filename = f'ppo_trajectories_{downsample_ratio}.json'
+        output_filename = f'vehicle_ppo_trajectories_{downsample_ratio}.json'
         output_path = test_results_dir + '/' + output_filename
         
         # Save results

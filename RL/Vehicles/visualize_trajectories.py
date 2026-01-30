@@ -129,45 +129,41 @@ def rollout_trajectory_deterministic_mean(
     # Initialize current state
     current_state = initial_state.clone()
     
-    # Action history buffer for transformer input
-    action_history_list = []  # List of [batch_size, 2] tensors
-    
     for t in range(seq_len):
-        # Prepare action history for transformer
-        if len(action_history_list) > 0:
-            # Stack recent actions (most recent last)
-            action_history = torch.stack(action_history_list, dim=1)  # [batch, len(action_history_list), 2]
-        else:
-            # No previous actions
-            action_history = None
-        
+        # Get current time index
+        current_time_idx = torch.tensor([float(t)], device=device, dtype=torch.float32)
+        if batch_size > 1:
+            current_time_idx = current_time_idx.expand(batch_size)
+
         # Get mean action from actor (deterministic, no sampling)
-        mean, _ = actor.forward(actual_trajectory, current_state, action_history)
-        # mean: [batch, 2]
+        # New signature: forward(current_state, current_time_index)
+        mean, _ = actor.forward(current_state, current_time_index=current_time_idx)
+        # mean: [batch, 2] or [2] if batch_size=1 and current_state is 1D
+        
+        # Ensure mean has batch dimension
+        if mean.dim() == 1:
+            mean = mean.unsqueeze(0)  # [1, 2]
         
         # Use mean as the deterministic action
-        deterministic_action = mean
-        
-        # Update action history
-        action_history_list.append(deterministic_action.clone())
-        # Limit history size
-        if hasattr(actor, 'action_history_len'):
-            max_history = actor.action_history_len
-        else:
-            max_history = 10  # Default fallback
-        if len(action_history_list) > max_history:
-            action_history_list.pop(0)  # Remove oldest action
+        deterministic_action = mean  # [batch, 2]
         
         # Apply dynamics to get next state (only if not at last step)
         if t < seq_len - 1:
+            from utils import ensure_batch_dim, ensure_tensor_shape
+            
+            # Ensure both state and action have consistent 2D shapes with matching batch dimension
+            state_for_dynamics = ensure_batch_dim(current_state, batch_size)
+            action_for_dynamics = ensure_batch_dim(deterministic_action, batch_size)
+            
             # Apply dynamics
             if use_ode_solver:
-                # Use RK4 ODE solver for more accurate integration
-                next_state = rk4_step(current_state, deterministic_action, dt, simple_car_dynamics_torch)
+                next_state = rk4_step(state_for_dynamics, action_for_dynamics, dt, simple_car_dynamics_torch)
             else:
-                # Use Euler integration
-                state_derivative = simple_car_dynamics_torch(current_state, deterministic_action, dt)
-                next_state = current_state + dt * state_derivative
+                state_derivative = simple_car_dynamics_torch(state_for_dynamics, action_for_dynamics, dt)
+                next_state = state_for_dynamics + dt * state_derivative
+            
+            # Ensure next_state has correct shape [batch_size, 4]
+            next_state = ensure_tensor_shape(next_state, (batch_size, 4))
             
             # Store the state AFTER applying dynamics at index t+1
             predicted_states[:, t + 1, :] = next_state
@@ -183,6 +179,7 @@ def generate_trajectory_comparison_plots(
     output_dir: Path,
     num_epochs: int = 20,
     algorithm_name: str = "unknown",
+    environment_name: str = "unknown",
     dt: float = 0.1,
     include_baseline: bool = True,
     include_deterministic_mean: bool = True,
@@ -255,83 +252,40 @@ def generate_trajectory_comparison_plots(
                 epochs_to_plot.append(closest_epoch)
                 checkpoint_files_to_use.append(available_checkpoints[closest_epoch])
         
-        # If we still don't have 9 unique epochs, fill with evenly spaced from available
-        if len(epochs_to_plot) < 9:
-            remaining_slots = 9 - len(epochs_to_plot)
-            # Get epochs we haven't used yet
-            unused_epochs = [e for e in available_epochs if e not in epochs_to_plot]
-            if unused_epochs:
-                # Add evenly spaced from unused epochs
-                indices = np.linspace(0, len(unused_epochs) - 1, min(remaining_slots, len(unused_epochs)), dtype=int)
-                for idx in indices:
-                    epoch = unused_epochs[idx]
-                    epochs_to_plot.append(epoch)
-                    checkpoint_files_to_use.append(available_checkpoints[epoch])
-            # If still not enough, pad with last epoch
-            while len(epochs_to_plot) < 9:
-                epochs_to_plot.append(epochs_to_plot[-1])
-                checkpoint_files_to_use.append(checkpoint_files_to_use[-1])
+        
     
     epochs_to_plot = epochs_to_plot[:9]
     checkpoint_files_to_use = checkpoint_files_to_use[:9]
     
     # Check if best_model.pt exists and replace 9th subplot with best model
     best_model_path = output_dir / 'best_model.pt'
-    if best_model_path.exists():
-        try:
-            best_checkpoint = torch.load(best_model_path, map_location='cpu')
-            best_epoch = best_checkpoint.get('epoch', num_epochs)
-            # Replace 9th subplot (index 8) with best model
-            epochs_to_plot[8] = best_epoch
-            checkpoint_files_to_use[8] = best_model_path
-            print(f"Using best model (epoch {best_epoch}) for 9th subplot")
-        except Exception as e:
-            print(f"Warning: Could not load best model: {e}")
+    
     
     print(f"Plotting comparisons at epochs: {epochs_to_plot}")
     
     # Load rollout trajectories from checkpoints (if available)
     rollout_trajectories_by_epoch = {}
     for epoch, checkpoint_path in zip(epochs_to_plot, checkpoint_files_to_use):
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')  # Load on CPU first
-            # Check for both old format (single trajectory) and new format (multiple trajectories)
-            if 'rollout_trajectories' in checkpoint:
-                # New format: multiple rollout trajectories [num_trajectories, seq_len, 4]
-                rollout_trajectories_by_epoch[epoch] = checkpoint['rollout_trajectories']
-            elif 'rollout_trajectory' in checkpoint:
-                # Old format: single rollout trajectory [seq_len, 4] - convert to [1, seq_len, 4]
-                single_traj = checkpoint['rollout_trajectory']
-                if len(single_traj.shape) == 2:
-                    single_traj = single_traj.unsqueeze(0)  # Add batch dimension
-                rollout_trajectories_by_epoch[epoch] = single_traj
-        except Exception as e:
-            print(f"Warning: Could not load rollout trajectories from epoch {epoch}: {e}")
-            continue
+    
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')  # Load on CPU first
+        
+            
+        rollout_trajectories_by_epoch[epoch] = checkpoint['rollout_trajectories']
+        
+    
     
     # If best model was used for 9th subplot, make sure it's loaded
     best_model_path = output_dir / 'best_model.pt'
     if best_model_path.exists() and best_model_path in checkpoint_files_to_use:
         best_epoch = epochs_to_plot[8]  # 9th subplot (index 8)
         if best_epoch not in rollout_trajectories_by_epoch:
-            try:
-                best_checkpoint = torch.load(best_model_path, map_location='cpu')
-                if 'rollout_trajectories' in best_checkpoint:
-                    rollout_trajectories_by_epoch[best_epoch] = best_checkpoint['rollout_trajectories']
-                elif 'rollout_trajectory' in best_checkpoint:
-                    single_traj = best_checkpoint['rollout_trajectory']
-                    if len(single_traj.shape) == 2:
-                        single_traj = single_traj.unsqueeze(0)
-                    rollout_trajectories_by_epoch[best_epoch] = single_traj
-            except Exception as e:
-                print(f"Warning: Could not load best model rollout trajectories: {e}")
+          
+            best_checkpoint = torch.load(best_model_path, map_location='cpu')
+            
+            rollout_trajectories_by_epoch[best_epoch] = best_checkpoint['rollout_trajectories']
+                
     
     # Check if we have saved rollout trajectories
-    if len(rollout_trajectories_by_epoch) == 0:
-        print("Error: No saved rollout trajectories found in checkpoints.")
-        print("Cannot generate comparison plots without saved trajectories.")
-        print("Make sure training was run with checkpoint saving enabled.")
-        return
     
     num_trajs_per_epoch = rollout_trajectories_by_epoch[list(rollout_trajectories_by_epoch.keys())[0]].shape[0]
     print(f"Found saved rollout trajectories for {len(rollout_trajectories_by_epoch)} epochs. "
@@ -342,56 +296,56 @@ def generate_trajectory_comparison_plots(
     if include_deterministic_mean and ActorNetwork is not None:
         print("Loading actor models for deterministic mean rollout...")
         for epoch, checkpoint_path in zip(epochs_to_plot, checkpoint_files_to_use):
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                if 'actor_state_dict' in checkpoint:
-                    # Get model parameters from checkpoint
-                    hidden_dim = checkpoint.get('hidden_dim', 128)
-                    num_layers = checkpoint.get('num_layers', 2)
-                    # action_history_len defaults to 20 in ActorNetwork, but check checkpoint first
-                    action_history_len = checkpoint.get('action_history_len', 20)
-                    
-                    # Create actor model
-                    actor = ActorNetwork(
-                        state_dim=4,
-                        action_dim=2,
-                        hidden_dim=hidden_dim,
-                        num_layers=num_layers,
-                        deterministic=True,  # Use deterministic mode for mean action
-                        action_history_len=action_history_len
-                    )
-                    actor.load_state_dict(checkpoint['actor_state_dict'])
-                    actor.eval()  # Set to evaluation mode
-                    actor_models_by_epoch[epoch] = actor
-            except Exception as e:
-                print(f"Warning: Could not load actor model from epoch {epoch}: {e}")
-                continue
+          
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                # Get model parameters from checkpoint
+            hidden_dim = checkpoint.get('hidden_dim', 128)
+            num_layers = checkpoint.get('num_layers', 2)       
+            # Create actor model (action_history_len was removed)
+            actor = ActorNetwork(
+                state_dim=4,
+                action_dim=2,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                deterministic=True  # Use deterministic mode for mean action
+            )
+            # Be tolerant to architecture changes across experiments
+           
+            actor.load_state_dict(checkpoint['actor_state_dict'], strict=False)
+            
+            actor.eval()  # Set to evaluation mode
+            actor_models_by_epoch[epoch] = actor
+            
     
     # If best model was used for 9th subplot, make sure actor model is loaded
     if include_deterministic_mean and ActorNetwork is not None and best_model_path.exists() and best_model_path in checkpoint_files_to_use:
         best_epoch = epochs_to_plot[8]  # 9th subplot (index 8)
         if best_epoch not in actor_models_by_epoch:
-            try:
-                best_checkpoint = torch.load(best_model_path, map_location='cpu')
-                if 'actor_state_dict' in best_checkpoint:
-                    hidden_dim = best_checkpoint.get('hidden_dim', 128)
-                    num_layers = best_checkpoint.get('num_layers', 2)
-                    action_history_len = best_checkpoint.get('action_history_len', 20)
-                    
-                    actor = ActorNetwork(
-                        state_dim=4,
-                        action_dim=2,
-                        hidden_dim=hidden_dim,
-                        num_layers=num_layers,
-                        deterministic=True,
-                        action_history_len=action_history_len
-                    )
-                    actor.load_state_dict(best_checkpoint['actor_state_dict'])
-                    actor.eval()
-                    actor_models_by_epoch[best_epoch] = actor
-            except Exception as e:
-                print(f"Warning: Could not load best model actor: {e}")
+        
+            best_checkpoint = torch.load(best_model_path, map_location='cpu')
     
+            hidden_dim = best_checkpoint.get('hidden_dim', 128)
+            num_layers = best_checkpoint.get('num_layers', 2)
+            
+            actor = ActorNetwork(
+                state_dim=4,
+                action_dim=2,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                deterministic=True
+            )
+            # try:
+            actor.load_state_dict(best_checkpoint['actor_state_dict'], strict=False)
+            #     if missing or unexpected:
+            #         print(f"Warning: partial actor checkpoint load for best model. "
+            #               f"missing={len(missing)}, unexpected={len(unexpected)}")
+            # except Exception as e:
+            #     print(f"Warning: could not load best actor model: {e}")
+            #     actor = None
+            
+            actor.eval()
+            actor_models_by_epoch[best_epoch] = actor
+        
     # Generate plots for each trajectory showing evolution across epochs
     num_trajectories = len(dataset)
     for traj_idx in tqdm(range(num_trajectories), desc="Generating epoch comparison plots"):
@@ -402,6 +356,7 @@ def generate_trajectory_comparison_plots(
             epochs_to_plot,
             output_dir,
             algorithm_name,
+            environment_name,
             dt,
             include_baseline,
             include_deterministic_mean,
@@ -411,17 +366,19 @@ def generate_trajectory_comparison_plots(
     
     print(f"Trajectory comparison plots saved to: {comparison_dir}")
     
-    # Generate separate mean vs actual trajectory comparison plots
-    if include_deterministic_mean and len(actor_models_by_epoch) > 0:
-        print("\nGenerating mean trajectory vs actual trajectory comparison plots...")
-        _generate_mean_vs_actual_comparison_plots(
-            dataset=dataset,
-            output_dir=output_dir,
-            actor_models_by_epoch=actor_models_by_epoch,
-            epochs_to_plot=epochs_to_plot,
-            algorithm_name=algorithm_name,
-            dt=dt
-        )
+  
+    
+    # Generate best rollout vs actual trajectory comparison plots
+    print("\nGenerating best rollout vs actual trajectory comparison plots...")
+    _generate_best_rollout_vs_actual_comparison_plots(
+        dataset=dataset,
+        output_dir=output_dir,
+        epochs_to_plot=epochs_to_plot,
+        checkpoint_files_to_use=checkpoint_files_to_use,
+        algorithm_name=algorithm_name,
+        dt=dt,
+        actual_states_downsampled=actual_states_downsampled
+    )
 
 
 def _create_epoch_comparison_plot_with_saved_trajectories(
@@ -431,6 +388,7 @@ def _create_epoch_comparison_plot_with_saved_trajectories(
     epochs_to_plot: list,
     output_dir: Path,
     algorithm_name: str = "unknown",
+    environment_name: str = "unknown",
     dt: float = 0.1,
     include_baseline: bool = True,
     include_deterministic_mean: bool = True,
@@ -573,19 +531,19 @@ def _create_epoch_comparison_plot_with_saved_trajectories(
                 best_loss = best_checkpoint.get('train_loss', 'N/A')
                 if isinstance(best_loss, (int, float)):
                     ax.set_title(f'Epoch {epoch} (BEST, loss={best_loss:.6f}, {num_trajectories} rollouts)', 
-                                fontweight='bold', color='green')
+                                fontweight='bold', color='green', fontsize=25)
                 else:
                     ax.set_title(f'Epoch {epoch} (BEST, {num_trajectories} rollouts)', 
-                                fontweight='bold', color='green')
+                                fontweight='bold', color='green', fontsize=25)
             except:
                 ax.set_title(f'Epoch {epoch} (BEST, {num_trajectories} rollouts)', 
-                            fontweight='bold', color='green')
+                            fontweight='bold', color='green', fontsize=25)
         else:
-            ax.set_title(f'Epoch {epoch} ({num_trajectories} rollouts)')
+            ax.set_title(f'Epoch {epoch} ({num_trajectories} rollouts)', fontsize=25)
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
         if plot_idx == 0:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=25)
         
         # Plot all rollout trajectories (up to 10)
         for traj_idx_plot in range(num_trajectories):
@@ -594,12 +552,12 @@ def _create_epoch_comparison_plot_with_saved_trajectories(
                    markersize=1, linewidth=2, alpha=0.4, zorder=5)
     
     plt.suptitle(f'Trajectory {traj_idx}: Evolution Across Training Epochs (10 Rollout Trajectories)', 
-                 fontsize=16, y=0.995)
+                 fontsize=25, y=0.995)
     plt.tight_layout()
     
     # Format dt value for filename (replace decimal point with underscore)
     dt_str = f"{dt:.3f}".replace('.', '_')
-    filename = f'trajectory_{traj_idx:04d}_{algorithm_name}_dt{dt_str}_epochs.png'
+    filename = f'{environment_name}_trajectory_{traj_idx:04d}_{algorithm_name}_dt{dt_str}_epochs.png'
     plt.savefig(comparison_dir / filename, 
                 dpi=150, bbox_inches='tight')
     plt.close()
@@ -611,7 +569,8 @@ def _generate_mean_vs_actual_comparison_plots(
     actor_models_by_epoch: Dict[int, nn.Module],
     epochs_to_plot: list,
     algorithm_name: str = "unknown",
-    dt: float = 0.1
+    dt: float = 0.1,
+    actual_states_downsampled: Optional[np.ndarray] = None
 ):
     """
     Generate separate comparison plots between deterministic mean trajectories and actual trajectories.
@@ -643,7 +602,8 @@ def _generate_mean_vs_actual_comparison_plots(
             epochs_to_plot=epochs_to_plot,
             output_dir=output_dir,
             algorithm_name=algorithm_name,
-            dt=dt
+            dt=dt,
+            actual_states_downsampled=actual_states_downsampled
         )
     
     print(f"Mean vs actual trajectory comparison plots saved to: {comparison_dir}")
@@ -656,7 +616,8 @@ def _create_mean_vs_actual_plot(
     epochs_to_plot: list,
     output_dir: Path,
     algorithm_name: str = "unknown",
-    dt: float = 0.1
+    dt: float = 0.1,
+    actual_states_downsampled: Optional[np.ndarray] = None
 ):
     """
     Create a 3x3 grid plot showing mean trajectory vs actual trajectory comparison across epochs.
@@ -688,6 +649,11 @@ def _create_mean_vs_actual_plot(
     
     actual_states = states_norm_np * state_std + state_mean
     actual_states_np = actual_states  # [seq_len, 4]
+
+    # Denormalize downsampled states if provided (they are passed in normalized space)
+    actual_states_downsampled_np = None
+    if actual_states_downsampled is not None:
+        actual_states_downsampled_np = actual_states_downsampled * state_std + state_mean
     
     # Normalize actual trajectory for actor input
     actual_trajectory_norm = torch.from_numpy(states_norm_np).float().unsqueeze(0)  # [1, seq_len, 4]
@@ -702,15 +668,28 @@ def _create_mean_vs_actual_plot(
             # If no actor model for this epoch, skip or show empty plot
             ax = axes[plot_idx]
             ax.text(0.5, 0.5, f'No model for epoch {epoch}', 
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'Epoch {epoch}')
+                   ha='center', va='center', transform=ax.transAxes, fontsize=25)
+            ax.set_title(f'Epoch {epoch}', fontsize=25)
             continue
         
         ax = axes[plot_idx]
         
         # Plot complete actual trajectory
         ax.plot(actual_states_np[:, 0], actual_states_np[:, 1], 'b--', 
-               markersize=2, label='Actual (complete)', linewidth=2, alpha=0.8, zorder=10)
+               markersize=2, label='Actual trajectory', linewidth=2, alpha=0.8, zorder=10)
+
+        # Plot downsampled actual states if provided
+        if actual_states_downsampled_np is not None:
+            ax.plot(
+                actual_states_downsampled_np[:, 0],
+                actual_states_downsampled_np[:, 1],
+                'b.',
+                markersize=25,
+                label='Waypoints',
+                linewidth=0,
+                alpha=0.7,
+                zorder=11
+            )
         
         # Plot deterministic mean rollout if available
         try:
@@ -732,30 +711,278 @@ def _create_mean_vs_actual_plot(
                 
                 # Plot deterministic mean trajectory
                 ax.plot(deterministic_traj_denorm[:, 0], deterministic_traj_denorm[:, 1], 'r-', 
-                       markersize=2, label='Deterministic mean', 
+                       markersize=2, label='Generated trajectory', 
                        linewidth=2, alpha=0.8, zorder=9)
         except Exception as e:
             print(f"Warning: Could not rollout deterministic mean trajectory for epoch {epoch}: {e}")
             ax.text(0.5, 0.5, f'Error: {str(e)[:50]}', 
-                   ha='center', va='center', transform=ax.transAxes, fontsize=8)
+                   ha='center', va='center', transform=ax.transAxes, fontsize=25)
         
         # Plot start point
         ax.plot(actual_states_np[0, 0], actual_states_np[0, 1], 'go', 
                markersize=8, label='Start', zorder=15)
         
-        ax.set_title(f'Epoch {epoch}')
+        ax.set_title(f'Iteration {epoch}', fontsize=25)
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
         if plot_idx == 0:
-            ax.legend(fontsize=10, loc='upper right')
+            ax.legend(fontsize=25, loc='upper right')
     
     plt.suptitle(f'Trajectory {traj_idx}: Mean vs Actual Comparison Across Training Epochs', 
-                 fontsize=16, y=0.995)
+                 fontsize=25, y=0.995)
     plt.tight_layout()
     
     # Format dt value for filename (replace decimal point with underscore)
     dt_str = f"{dt:.3f}".replace('.', '_')
     filename = f'trajectory_{traj_idx:04d}_{algorithm_name}_dt{dt_str}_mean_vs_actual.png'
+    plt.savefig(comparison_dir / filename, 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_best_rollout_vs_actual_comparison_plots(
+    dataset,
+    output_dir: Path,
+    epochs_to_plot: list,
+    checkpoint_files_to_use: list,
+    algorithm_name: str = "unknown",
+    dt: float = 0.1,
+    actual_states_downsampled: Optional[np.ndarray] = None
+):
+    """
+    Generate separate comparison plots between best rollout trajectories and actual trajectories.
+    
+    Creates a separate figure for each trajectory showing best rollout vs actual comparison across epochs.
+    
+    Args:
+        dataset: Dataset containing normalized states
+        output_dir: Directory containing checkpoints and where to save plots
+        epochs_to_plot: List of epoch numbers to plot
+        checkpoint_files_to_use: List of checkpoint file paths corresponding to epochs_to_plot
+        algorithm_name: Name of the reinforcement learning algorithm
+        dt: Discrete time step value
+        actual_states_downsampled: Optional downsampled actual states (normalized)
+    """
+    comparison_dir = output_dir / 'trajectory_comparisons'
+    comparison_dir.mkdir(exist_ok=True)
+    
+    # Load best rollout trajectories and reward sums from checkpoints
+    best_rollout_trajectories_by_epoch = {}
+    best_rollout_reward_sums_by_epoch = {}
+    for epoch, checkpoint_path in zip(epochs_to_plot, checkpoint_files_to_use):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if 'best_rollout_trajectory' in checkpoint:
+                best_rollout_trajectories_by_epoch[epoch] = checkpoint['best_rollout_trajectory']
+            if 'best_rollout_reward_sum' in checkpoint:
+                best_rollout_reward_sums_by_epoch[epoch] = checkpoint['best_rollout_reward_sum']
+        except Exception as e:
+            print(f"Warning: Could not load best rollout trajectory for epoch {epoch}: {e}")
+    
+    # Also check best_model.pt if it exists
+    best_model_path = output_dir / 'best_model.pt'
+    if best_model_path.exists():
+        try:
+            best_checkpoint = torch.load(best_model_path, map_location='cpu')
+            if 'best_rollout_trajectory' in best_checkpoint:
+                # Find the epoch number from the checkpoint
+                best_epoch = best_checkpoint.get('epoch', None)
+                if best_epoch is not None and best_epoch not in best_rollout_trajectories_by_epoch:
+                    best_rollout_trajectories_by_epoch[best_epoch] = best_checkpoint['best_rollout_trajectory']
+                if 'best_rollout_reward_sum' in best_checkpoint and best_epoch is not None:
+                    best_rollout_reward_sums_by_epoch[best_epoch] = best_checkpoint['best_rollout_reward_sum']
+        except Exception as e:
+            print(f"Warning: Could not load best rollout trajectory from best_model.pt: {e}")
+    
+    # Find the overall best rollout across all epochs (highest reward sum)
+    overall_best_epoch = None
+    overall_best_trajectory = None
+    if best_rollout_reward_sums_by_epoch:
+        overall_best_epoch = max(best_rollout_reward_sums_by_epoch, key=best_rollout_reward_sums_by_epoch.get)
+        overall_best_trajectory = best_rollout_trajectories_by_epoch.get(overall_best_epoch, None)
+        print(f"Overall best rollout found at epoch {overall_best_epoch} with reward sum {best_rollout_reward_sums_by_epoch[overall_best_epoch]:.6f}")
+    
+    if not best_rollout_trajectories_by_epoch:
+        print("Warning: No best rollout trajectories found in checkpoints. Skipping best rollout plots.")
+        return
+    
+    # Generate plots for each trajectory
+    num_trajectories = len(dataset)
+    for traj_idx in tqdm(range(num_trajectories), desc="Generating best rollout vs actual comparison plots"):
+        _create_best_rollout_vs_actual_plot(
+            traj_idx=traj_idx,
+            dataset=dataset,
+            best_rollout_trajectories_by_epoch=best_rollout_trajectories_by_epoch,
+            epochs_to_plot=epochs_to_plot,
+            output_dir=output_dir,
+            algorithm_name=algorithm_name,
+            dt=dt,
+            actual_states_downsampled=actual_states_downsampled,
+            overall_best_trajectory=overall_best_trajectory,
+            overall_best_epoch=overall_best_epoch
+        )
+    
+    print(f"Best rollout vs actual trajectory comparison plots saved to: {comparison_dir}")
+
+
+def _create_best_rollout_vs_actual_plot(
+    traj_idx: int,
+    dataset,
+    best_rollout_trajectories_by_epoch: Dict[int, torch.Tensor],
+    epochs_to_plot: list,
+    output_dir: Path,
+    algorithm_name: str = "unknown",
+    dt: float = 0.1,
+    actual_states_downsampled: Optional[np.ndarray] = None,
+    overall_best_trajectory: Optional[torch.Tensor] = None,
+    overall_best_epoch: Optional[int] = None
+):
+    """
+    Create a 3x3 grid plot showing best rollout trajectory vs actual trajectory comparison across epochs.
+    
+    Args:
+        traj_idx: Index of trajectory to plot
+        dataset: Dataset containing normalized states
+        best_rollout_trajectories_by_epoch: Dictionary mapping epoch numbers to best rollout trajectories (normalized)
+        epochs_to_plot: List of epoch numbers to plot
+        output_dir: Directory to save plot
+        algorithm_name: Name of the reinforcement learning algorithm
+        dt: Discrete time step value
+        actual_states_downsampled: Optional downsampled actual states (normalized)
+    """
+    comparison_dir = output_dir / 'trajectory_comparisons'
+    # Get actual trajectory data
+    states_norm = dataset[traj_idx]  # [seq_len, 4] - normalized
+    states_norm_np = states_norm.numpy() if isinstance(states_norm, torch.Tensor) else states_norm
+    
+    # Denormalize actual states
+    state_mean = dataset.state_mean
+    state_std = dataset.state_std
+    if isinstance(state_mean, torch.Tensor):
+        state_mean = state_mean.numpy()
+    if isinstance(state_std, torch.Tensor):
+        state_std = state_std.numpy()
+    
+    actual_states = states_norm_np * state_std + state_mean
+    actual_states_np = actual_states  # [seq_len, 4]
+
+    # Denormalize downsampled states if provided (they are passed in normalized space)
+    actual_states_downsampled_np = None
+    if actual_states_downsampled is not None:
+        actual_states_downsampled_np = actual_states_downsampled * state_std + state_mean
+    
+    # Create 3x3 grid
+    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+    axes = axes.flatten()
+    
+    for plot_idx, epoch in enumerate(epochs_to_plot[:9]):  # Limit to 9 plots
+        ax = axes[plot_idx]
+        
+        # For the last plot (9th subplot, index 8), use the overall best rollout across all epochs
+        if plot_idx == 8 and overall_best_trajectory is not None:
+            # Plot complete actual trajectory
+            ax.plot(actual_states_np[:, 0], actual_states_np[:, 1], 'b--', 
+                   markersize=2, label='Actual trajectory', linewidth=2, alpha=0.8, zorder=10)
+
+            # Plot downsampled actual states if provided
+            if actual_states_downsampled_np is not None:
+                ax.plot(
+                    actual_states_downsampled_np[:, 0],
+                    actual_states_downsampled_np[:, 1],
+                    'b.',
+                    markersize=25,
+                    label='Waypoints',
+                    linewidth=0,
+                    alpha=0.7,
+                    zorder=11
+                )
+            
+            # Plot overall best rollout trajectory
+            try:
+                best_rollout_norm = overall_best_trajectory
+                if isinstance(best_rollout_norm, torch.Tensor):
+                    best_rollout_norm = best_rollout_norm.numpy()
+                
+                # Denormalize best rollout trajectory
+                best_rollout_denorm = best_rollout_norm * state_std + state_mean  # [seq_len, 4]
+                
+                # Plot overall best rollout trajectory
+                ax.plot(best_rollout_denorm[:, 0], best_rollout_denorm[:, 1], 'r-', 
+                       markersize=2, label='Best rollout (all epochs)', 
+                       linewidth=2, alpha=0.8, zorder=9)
+                
+                # Plot start point
+                ax.plot(actual_states_np[0, 0], actual_states_np[0, 1], 'go', 
+                       markersize=8, label='Start', zorder=15)
+                
+                ax.set_title(f'Best Overall (Epoch {overall_best_epoch})', fontweight='bold', color='green', fontsize=25)
+                print(f"Plotted overall best rollout found at epoch {overall_best_epoch}")
+            except Exception as e:
+                print(f"Warning: Could not plot overall best rollout trajectory: {e}")
+                ax.text(0.5, 0.5, f'Error: {str(e)[:50]}', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=25)
+        else:
+            # For other plots, use epoch-specific best rollout
+            if epoch not in best_rollout_trajectories_by_epoch:
+                # If no best rollout for this epoch, show empty plot
+                ax.text(0.5, 0.5, f'No best rollout for epoch {epoch}', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=25)
+                ax.set_title(f'Epoch {epoch}', fontsize=25)
+                continue
+            
+            # Plot complete actual trajectory
+            ax.plot(actual_states_np[:, 0], actual_states_np[:, 1], 'b--', 
+                   markersize=2, label='Actual trajectory', linewidth=2, alpha=0.8, zorder=10)
+
+            # Plot downsampled actual states if provided
+            if actual_states_downsampled_np is not None:
+                ax.plot(
+                    actual_states_downsampled_np[:, 0],
+                    actual_states_downsampled_np[:, 1],
+                    'b.',
+                    markersize=25,
+                    label='Waypoints',
+                    linewidth=0,
+                    alpha=0.7,
+                    zorder=11
+                )
+            
+            # Plot best rollout trajectory for this epoch
+            try:
+                best_rollout_norm = best_rollout_trajectories_by_epoch[epoch]
+                if isinstance(best_rollout_norm, torch.Tensor):
+                    best_rollout_norm = best_rollout_norm.numpy()
+                
+                # Denormalize best rollout trajectory
+                best_rollout_denorm = best_rollout_norm * state_std + state_mean  # [seq_len, 4]
+                
+                # Plot best rollout trajectory
+                ax.plot(best_rollout_denorm[:, 0], best_rollout_denorm[:, 1], 'r-', 
+                       markersize=2, label='Generated trajectory', 
+                       linewidth=2, alpha=0.8, zorder=9)
+            except Exception as e:
+                print(f"Warning: Could not plot best rollout trajectory for epoch {epoch}: {e}")
+                ax.text(0.5, 0.5, f'Error: {str(e)[:50]}', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=25)
+            
+            # Plot start point
+            ax.plot(actual_states_np[0, 0], actual_states_np[0, 1], 'go', 
+                   markersize=8, label='Start', zorder=15)
+            
+            ax.set_title(f'Iteration {epoch}', fontsize=25)
+        
+        ax.grid(True, alpha=0.3)
+        ax.axis('equal')
+        if plot_idx == 0:
+            ax.legend(fontsize=25, loc='upper right')
+    
+    plt.suptitle(f'Trajectory {traj_idx}: Best Rollout vs Actual Comparison Across Training Epochs', 
+                 fontsize=25, y=0.995)
+    plt.tight_layout()
+    
+    # Format dt value for filename (replace decimal point with underscore)
+    dt_str = f"{dt:.3f}".replace('.', '_')
+    filename = f'trajectory_{traj_idx:04d}_{algorithm_name}_dt{dt_str}_best_rollout_vs_actual.png'
     plt.savefig(comparison_dir / filename, 
                 dpi=150, bbox_inches='tight')
     plt.close()

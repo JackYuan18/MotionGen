@@ -6,6 +6,7 @@ This module provides shared utility functions used across different RL training 
 
 import torch
 import torch.nn as nn
+from typing import Tuple, Optional
 
 # Time step for dynamics (seconds)
 DT = 0.1
@@ -74,6 +75,125 @@ def rk4_step(
     return next_state
 
 
+def ensure_batch_dim(tensor: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
+    """
+    Ensure tensor has batch dimension. If 1D, add batch dimension.
+    
+    Args:
+        tensor: Input tensor [state_dim] or [batch, state_dim]
+        batch_size: Desired batch size (default: 1)
+    
+    Returns:
+        Tensor with shape [batch_size, ...]
+    """
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.shape[0] != batch_size:
+        tensor = tensor.expand(batch_size, *tensor.shape[1:]) if tensor.shape[0] == 1 else tensor[:batch_size]
+    return tensor
+
+
+def normalize_time_indices(
+    downsampled_indices: Optional[torch.Tensor],
+    seq_len: int,
+    batch_size: int,
+    device: torch.device
+) -> Tuple[torch.Tensor, float]:
+    """
+    Normalize time indices, handling None, empty, and shape mismatches.
+    
+    Args:
+        downsampled_indices: Time indices [batch, seq_len] or None
+        seq_len: Sequence length
+        batch_size: Batch size
+        device: Device for tensor creation
+    
+    Returns:
+        Tuple of (normalized_indices, max_time_idx)
+    """
+    # Create default sequential indices if None or empty
+    if downsampled_indices is None or downsampled_indices.numel() == 0:
+        indices = torch.arange(seq_len, device=device, dtype=torch.float32)
+        indices = indices.unsqueeze(0).expand(batch_size, -1)
+    else:
+        # Ensure float32 and correct batch size
+        indices = downsampled_indices.float()
+        if indices.shape[0] != batch_size:
+            indices = indices.expand(batch_size, -1) if indices.shape[0] == 1 else indices[:batch_size]
+    
+    # Normalize to [0, 1] range
+    max_time_idx = indices.max().item() if indices.numel() > 0 else 0.0
+    indices_norm = indices / max_time_idx if max_time_idx > 0 else indices
+    
+    return indices_norm, max_time_idx
+
+
+def prepare_time_index(
+    current_time_index: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+    max_time_idx: float = 1.0
+) -> torch.Tensor:
+    """
+    Prepare and normalize current time index.
+    
+    Args:
+        current_time_index: Time index tensor or None
+        batch_size: Batch size
+        device: Device for tensor creation
+        max_time_idx: Maximum time index for normalization
+    
+    Returns:
+        Normalized time index [batch_size]
+    """
+    if current_time_index is None:
+        time_idx = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    else:
+        time_idx = current_time_index.float()
+        if time_idx.dim() == 0:
+            time_idx = time_idx.unsqueeze(0).expand(batch_size)
+        elif time_idx.shape[0] != batch_size:
+            time_idx = time_idx[0:1].expand(batch_size) if time_idx.shape[0] > 0 else torch.zeros(batch_size, device=device, dtype=torch.float32)
+    
+    # Normalize
+    return time_idx / max_time_idx if max_time_idx > 0 else time_idx
+
+
+def ensure_tensor_shape(tensor: torch.Tensor, target_shape: Tuple[int, ...]) -> torch.Tensor:
+    """
+    Ensure tensor has target shape, reshaping/expanding as needed.
+    
+    Args:
+        tensor: Input tensor
+        target_shape: Desired shape
+    
+    Returns:
+        Tensor with target shape
+    """
+    if tensor.shape == target_shape:
+        return tensor
+    
+    # Handle dimension mismatches
+    if tensor.dim() < len(target_shape):
+        tensor = tensor.unsqueeze(0)
+    
+    # Handle batch size mismatches
+    if tensor.shape[0] != target_shape[0]:
+        if tensor.shape[0] == 1:
+            tensor = tensor.expand(target_shape[0], *tensor.shape[1:])
+        else:
+            tensor = tensor[:target_shape[0]]
+    
+    # Handle feature dimension mismatches
+    if len(target_shape) > 1 and tensor.shape[1:] != target_shape[1:]:
+        if tensor.numel() == target_shape[0] * target_shape[1]:
+            tensor = tensor.view(target_shape)
+        else:
+            tensor = tensor[:, :target_shape[1]]
+    
+    return tensor
+
+
 class StateFeedbackODE(nn.Module):
     """
     ODE function wrapper for state-feedback control policy.
@@ -87,7 +207,8 @@ class StateFeedbackODE(nn.Module):
         self,
         actor: nn.Module,
         actual_trajectory: torch.Tensor,
-        control_update_dt: float = DT
+        control_update_dt: float = DT,
+        downsampled_indices: torch.Tensor = None
     ):
         """
         Initialize the ODE function.
@@ -96,16 +217,19 @@ class StateFeedbackODE(nn.Module):
             actor: ActorNetwork policy
             actual_trajectory: [1, actual_seq_len, 4] actual trajectory states (single batch)
             control_update_dt: Time interval between control updates
+            downsampled_indices: [1, seq_len_downsampled] time indices of downsampled states (optional)
         """
         super().__init__()
         self.actor = actor
         self.actual_trajectory = actual_trajectory  # [1, actual_seq_len, 4]
         self.control_update_dt = control_update_dt
+        self.downsampled_indices = downsampled_indices  # [1, seq_len_downsampled] or None
         
         # Cache for controls (updated at discrete intervals)
         self.last_control_time = -float('inf')
         self.cached_control = None
         self.cached_state = None
+        self.total_time = None  # Will be set from integration times
     
     def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         """
@@ -131,10 +255,19 @@ class StateFeedbackODE(nn.Module):
             # Reshape state for actor (expects [batch, 4])
             state_batch = state.unsqueeze(0)  # [1, 4]
             
+            # Convert continuous time to discrete time index
+            # We approximate the time index based on the ratio of current time to total time
+            # This is an approximation since we don't know the exact sequence length during ODE integration
+            # For now, we'll use a simple mapping: time_index = int(time / dt) where dt is approximate
+            # Since we don't have dt here, we'll use 0 as a fallback (will be corrected at output times)
+            current_time_idx = torch.tensor([0], device=state.device, dtype=torch.long)
+            
             # Get control from actor using mean (deterministic for ODE integration)
             # We'll sample controls later at output times for log_probs
-            # Note: action_history is not used in continuous ODE mode for simplicity
-            mean, _, _ = self.actor.forward(self.actual_trajectory, state_batch, action_history=None)
+            mean, _ = self.actor.forward(
+                state_batch, 
+                current_time_index=current_time_idx
+            )
             control = mean.squeeze(0)  # [2]
             
             # Cache control and time
@@ -155,6 +288,65 @@ class StateFeedbackODE(nn.Module):
         return state_derivative.squeeze(0)  # [4]
 
 
+def get_next_downsampled_state(
+    current_time_index: torch.Tensor,
+    downsampled_states: torch.Tensor,
+    downsampled_indices: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Find the next downsampled state and its time index for each current time index.
+    
+    Args:
+        current_time_index: [batch_size] current time indices
+        downsampled_states: [batch_size, seq_len_downsampled, state_dim] or [1, seq_len_downsampled, state_dim] downsampled states
+        downsampled_indices: [batch_size, seq_len_downsampled] or [1, seq_len_downsampled] time indices of downsampled states
+    
+    Returns:
+        next_state: [batch_size, state_dim] next downsampled state
+        next_time_index: [batch_size] time index of next downsampled state
+    """
+    batch_size = current_time_index.shape[0]
+    device = current_time_index.device
+    seq_len_downsampled = downsampled_states.shape[1]
+    
+    # Expand downsampled_states and downsampled_indices to match batch_size if needed
+    if downsampled_states.shape[0] == 1 and batch_size > 1:
+        downsampled_states = downsampled_states.expand(batch_size, -1, -1)
+    if downsampled_indices.shape[0] == 1 and batch_size > 1:
+        downsampled_indices = downsampled_indices.expand(batch_size, -1)
+    
+    # Expand for broadcasting: [batch_size, 1] vs [batch_size, seq_len_downsampled]
+    current_time_expanded = current_time_index.unsqueeze(1).float()  # [batch_size, 1]
+    downsampled_indices_expanded = downsampled_indices.unsqueeze(1).float()  # [batch_size, 1, seq_len_downsampled]
+    
+    # Find next downsampled states: mask where downsampled_indices > current_time
+    next_mask = downsampled_indices_expanded > current_time_expanded.unsqueeze(2)  # [batch_size, 1, seq_len_downsampled]
+    
+    # Get next time indices (smallest time index > current_time for each batch)
+    if downsampled_indices_expanded.dtype.is_floating_point:
+        max_value = torch.finfo(downsampled_indices_expanded.dtype).max
+    else:
+        max_value = torch.iinfo(downsampled_indices_expanded.dtype).max
+    
+    next_time_indices = torch.where(next_mask, downsampled_indices_expanded, torch.full_like(downsampled_indices_expanded, max_value))
+    next_time_idx_values, next_time_idx_positions = next_time_indices.min(dim=2)  # [batch_size, 1]
+    next_time_idx_values = next_time_idx_values.squeeze(1)  # [batch_size]
+    next_time_idx_positions = next_time_idx_positions.squeeze(1)  # [batch_size]
+    
+    # Check if there's a valid next state (not max_value)
+    has_next = next_time_idx_values < max_value
+    
+    # Get next target states using advanced indexing
+    target_indices = torch.where(has_next, next_time_idx_positions, torch.full_like(next_time_idx_positions, seq_len_downsampled - 1, dtype=torch.long))
+    
+    # Use batch indexing to get target states: [batch_size, state_dim]
+    batch_indices = torch.arange(batch_size, device=device)
+    next_states = downsampled_states[batch_indices, target_indices]  # [batch_size, state_dim]
+    next_time_indices = torch.where(has_next, next_time_idx_values, downsampled_indices[batch_indices, -1])
+    
+    return next_states, next_time_indices
+
+
 def rollout_trajectory_state_feedback(
     actor: nn.Module,
     initial_state: torch.Tensor,
@@ -164,7 +356,7 @@ def rollout_trajectory_state_feedback(
     use_history: bool = True,
     history_length: int = 10,
     use_ode_solver: bool = True,
-    use_continuous_ode: bool = True
+    use_continuous_ode: bool = True,
 ) -> tuple:
     """
     Rollout trajectory using state-feedback control policy with ActorNetwork.
@@ -193,211 +385,75 @@ def rollout_trajectory_state_feedback(
     device = initial_state.device
     
     # If using continuous ODE, solve over full time horizon and sample at discrete times
-    if use_continuous_ode and TORCHDIFFEQ_AVAILABLE:
-        return rollout_trajectory_continuous_ode(
-            actor=actor,
-            initial_state=initial_state,
-            actual_trajectory=actual_trajectory,
-            seq_len=seq_len,
-            dt=dt,
-            use_history=use_history,
-            history_length=history_length
-        )
+    # if use_continuous_ode and TORCHDIFFEQ_AVAILABLE:
+    #     return rollout_trajectory_continuous_ode(
+    #         actor=actor,
+    #         initial_state=initial_state,
+    #         actual_trajectory=actual_trajectory,
+    #         seq_len=seq_len,
+    #         dt=dt,
+    #         use_history=use_history,
+    #         history_length=history_length,
+    #         downsampled_indices=downsampled_indices
+    #     )
     
     # Otherwise, use discrete-time integration
     # Adjust sequence length based on dt ratio
-    seq_len = int(seq_len * DT // dt)
+    # seq_len = int(seq_len * DT // dt)
     # Initialize trajectory and controls
     # predicted_states will match dataset format: [initial_state, state_after_1_step, ..., state_after_seq_len-1_steps]
     predicted_states = torch.zeros(batch_size, seq_len, 4, device=device)
     sampled_controls = torch.zeros(batch_size, seq_len, 2, device=device)
     log_probs = torch.zeros(batch_size, seq_len, device=device)
     
-    # Initialize current state and store initial state
-    current_state = initial_state.clone()
-    predicted_states[:, 0, :] = initial_state.clone()
+    # Initialize current state and store initial state (avoid unnecessary cloning)
+    current_state = initial_state  # Use reference, will update in-place where possible
+    predicted_states[:, 0, :] = initial_state  # Direct assignment
     
-    # Predicted state history buffer (for context if use_history is True)
-    predicted_history = [initial_state.clone()]  # List of [batch_size, 4] tensors
+    # Pre-allocate history buffer as tensor for better GPU utilization
+    # Use a circular buffer approach with tensor instead of list
+    if use_history:
+        history_buffer = torch.zeros(batch_size, history_length, 4, device=device)
+        history_buffer[:, 0, :] = initial_state
+        history_ptr = 1
+    else:
+        history_buffer = None
+        history_ptr = 0
     
-    # Action history buffer for transformer input
-    action_history_list = []  # List of [batch_size, 2] tensors
+    # Pre-allocate time indices tensor
+    time_indices = torch.arange(seq_len - 1, device=device, dtype=torch.long)
     
-    for t in range(seq_len):
-        # Prepare actual trajectory input for actor
-        # If use_history, use recent predicted states combined with actual trajectory
-        # Otherwise, just use the full actual trajectory
-        if use_history and len(predicted_history) > 1:
-            # Use sliding window of recent predicted states
-            history_window = min(len(predicted_history), history_length)
-            recent_predicted = torch.stack(predicted_history[-history_window:], dim=1)  # [batch, history_window, 4]
-            # Combine with actual trajectory: concatenate along sequence dimension
-            # Use actual trajectory as the main context
-            actual_traj_input = actual_trajectory  # [batch, actual_seq_len, 4]
-        else:
-            # Use full actual trajectory
-            actual_traj_input = actual_trajectory  # [batch, actual_seq_len, 4]
+    for t_idx, t in enumerate(range(seq_len - 1)):
+        # Use pre-allocated time index
+        current_time_idx = time_indices[t_idx:t_idx+1].expand(batch_size)
         
-        # Prepare action history for transformer
-        if len(action_history_list) > 0:
-            # Stack recent actions (most recent last)
-            action_history = torch.stack(action_history_list, dim=1)  # [batch, len(action_history_list), 2]
-        else:
-            # No previous actions
-            action_history = None
-        
-        # Sample action from actor (stochastic policy)
-        # actor.sample() returns (action, log_prob, mean)
-        sampled_control, log_prob, _ = actor.sample(actual_traj_input, current_state, action_history)
-        # sampled_control: [batch, 2]
-        # log_prob: [batch] (already summed over action dimensions)
+        # Sample action from actor (stochastic policy) - batch processing on GPU
+        sampled_control, log_prob, _ = actor.sample(
+            current_state, 
+            current_time_index=current_time_idx
+        )
         
         # Store control and log prob
         sampled_controls[:, t, :] = sampled_control
         log_probs[:, t] = log_prob
-        
-        # Update action history
-        action_history_list.append(sampled_control.clone())
-        # Limit history size to action_history_len (defined in actor network)
-        if hasattr(actor, 'action_history_len'):
-            max_history = actor.action_history_len
+        # print(sampled_control)
+        # Apply dynamics - vectorized on GPU
+        if use_ode_solver:
+            next_state = rk4_step(current_state, sampled_control, dt, simple_car_dynamics_torch)
         else:
-            max_history = 10  # Default fallback
-        if len(action_history_list) > max_history:
-            action_history_list.pop(0)  # Remove oldest action
+            state_derivative = simple_car_dynamics_torch(current_state, sampled_control, dt)
+            next_state = current_state + dt * state_derivative
         
-        # Apply dynamics to get next state (only if not at last step)
-        if t < seq_len - 1:
-            # Apply dynamics
-            if use_ode_solver:
-                # Use RK4 ODE solver for more accurate integration
-                next_state = rk4_step(current_state, sampled_control, dt, simple_car_dynamics_torch)
-            else:
-                # Use Euler integration (simpler but less accurate)
-                state_derivative = simple_car_dynamics_torch(current_state, sampled_control, dt)
-                next_state = current_state + dt * state_derivative
-            
-            # Store the state AFTER applying dynamics at index t+1
-            predicted_states[:, t + 1, :] = next_state
-            
-            # Update state and history
-            current_state = next_state.clone()
-            predicted_history.append(current_state)
-            
-            # Limit history size
-            if len(predicted_history) > history_length:
-                predicted_history.pop(0)
+        # Store next state and update current state (avoid clone if possible)
+        predicted_states[:, t + 1, :] = next_state
+        current_state = next_state  # Update reference
+        
+        # Update history buffer if needed (circular buffer)
+        if use_history:
+            history_buffer[:, history_ptr % history_length, :] = next_state
+            history_ptr = (history_ptr + 1) % history_length
     
     return predicted_states, sampled_controls, log_probs
 
 
-def rollout_trajectory_continuous_ode(
-    actor: nn.Module,
-    initial_state: torch.Tensor,
-    actual_trajectory: torch.Tensor,
-    seq_len: int,
-    dt: float = DT,
-    use_history: bool = True,
-    history_length: int = 10
-) -> tuple:
-    """
-    Rollout trajectory using continuous ODE solver (torchdiffeq).
-    
-    This function solves the ODE continuously over the full time horizon and then
-    samples the states at desired discrete time points. Controls are updated at
-    fine intervals (control_update_dt) during integration, but we only output
-    states and sample controls at the desired output times.
-    
-    Args:
-        actor: ActorNetwork policy
-        initial_state: [batch_size, 4] initial state [x, y, θ, v]
-        actual_trajectory: [batch_size, actual_seq_len, 4] actual trajectory states
-        seq_len: Number of desired output time steps
-        dt: Time step for desired output discretization
-        use_history: If True, use sliding window of recent predicted states (not used in ODE mode)
-        history_length: Length of history window (not used in ODE mode)
-    
-    Returns:
-        tuple: (predicted_states [batch, seq_len, 4], sampled_controls [batch, seq_len, 2], log_probs [batch, seq_len])
-    """
-    if not TORCHDIFFEQ_AVAILABLE:
-        raise ImportError(
-            "torchdiffeq is required for continuous ODE solving. "
-            "Install it with: pip install torchdiffeq"
-        )
-    
-    batch_size = initial_state.shape[0]
-    device = initial_state.device
-    
-    # Define time points for desired output sampling
-    total_time = (seq_len - 1) * dt
-    output_times = torch.linspace(0, total_time, seq_len, device=device)  # [seq_len]
-    
-    # Use finer time grid for ODE integration to get smooth solution
-    # This allows adaptive step sizing within the ODE solver
-    # We'll still only output at desired times
-    num_integration_steps = max(seq_len * 2, 50)  # At least 2x resolution
-    integration_times = torch.linspace(0, total_time, num_integration_steps, device=device)
-    
-    # Initialize output arrays
-    predicted_states = torch.zeros(batch_size, seq_len, 4, device=device)
-    sampled_controls = torch.zeros(batch_size, seq_len, 2, device=device)
-    log_probs = torch.zeros(batch_size, seq_len, device=device)
-    
-    # Process each batch element separately (torchdiffeq works with single states)
-    for batch_idx in range(batch_size):
-        # Get initial state for this batch element
-        init_state_single = initial_state[batch_idx].clone()  # [4]
-        actual_traj_single = actual_trajectory[batch_idx:batch_idx+1]  # [1, actual_seq_len, 4]
-        
-        # Create ODE function for this batch element
-        # Use finer control update interval for smoother integration
-        control_update_dt = dt / 2  # Update controls twice per output interval
-        ode_func = StateFeedbackODE(
-            actor=actor,
-            actual_trajectory=actual_traj_single,
-            control_update_dt=control_update_dt
-        )
-        
-        # Solve ODE continuously using adaptive solver
-        # odeint returns [num_time_steps, 4] for single initial state
-        solution_all_times = odeint(
-            ode_func, 
-            init_state_single, 
-            integration_times, 
-            method='rk4',
-            options={'step_size': dt / 10}  # Fine step size for accuracy
-        )  # [num_integration_steps, 4]
-        
-        # Interpolate solution at desired output times
-        # Simple linear interpolation (or we can use the closest integration points)
-        for t_idx, t in enumerate(output_times):
-            t_val = t.item()
-            
-            # Find closest integration time indices
-            if t_val <= integration_times[0].item():
-                state_at_t = solution_all_times[0]  # [4]
-            elif t_val >= integration_times[-1].item():
-                state_at_t = solution_all_times[-1]  # [4]
-            else:
-                # Linear interpolation
-                idx = torch.searchsorted(integration_times, t_val) - 1
-                idx = max(0, min(idx, len(integration_times) - 2))
-                t0 = integration_times[idx].item()
-                t1 = integration_times[idx + 1].item()
-                alpha = (t_val - t0) / (t1 - t0) if t1 > t0 else 0.0
-                state_at_t = (1 - alpha) * solution_all_times[idx] + alpha * solution_all_times[idx + 1]
-            
-            # Store predicted state
-            predicted_states[batch_idx, t_idx] = state_at_t
-            
-            # Sample control and log prob at this output time (for stochastic policy)
-            state_for_actor = state_at_t.unsqueeze(0)  # [1, 4]
-            # Note: action_history is not used in continuous ODE mode for simplicity
-            sampled_control, log_prob, _ = actor.sample(actual_traj_single, state_for_actor[0], action_history=None)
-            # sampled_control: [2], log_prob: scalar
-            
-            sampled_controls[batch_idx, t_idx] = sampled_control
-            log_probs[batch_idx, t_idx] = log_prob
-    
-    return predicted_states, sampled_controls, log_probs
+

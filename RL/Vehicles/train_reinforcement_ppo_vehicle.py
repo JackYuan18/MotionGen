@@ -31,12 +31,12 @@ from data_loader import (
     prepare_training_data
 )
 from visualize_trajectories import generate_trajectory_comparison_plots
-from rewards import compute_reward
+from rewards import compute_reward_downsampled_next
 from utils import rollout_trajectory_state_feedback, simple_car_dynamics_torch, DT
 from ppo_args import add_ppo_common_args, add_trajectory_data_args
+# NOTE: Actor/Value now only depend on (current_state, current_time_index). No next-downsampled lookup needed.
 
-
-def downsample_states(states: torch.Tensor, ratio: int) -> torch.Tensor:
+def downsample_states(states: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Downsample states by keeping every Nth state.
     
@@ -45,17 +45,33 @@ def downsample_states(states: torch.Tensor, ratio: int) -> torch.Tensor:
         ratio: Downsample ratio (keep every Nth state, starting from index 0)
     
     Returns:
-        Downsampled states with shape [batch_size, new_seq_len, state_dim] or [new_seq_len, state_dim]
+        Tuple of:
+        - Downsampled states with shape [batch_size, new_seq_len, state_dim] or [new_seq_len, state_dim]
+        - Indices tensor with shape [new_seq_len] or [batch_size, new_seq_len] containing the original indices
     """
     if ratio <= 1:
-        return states
+        seq_len = states.shape[-2] if len(states.shape) == 3 else states.shape[0]
+        if len(states.shape) == 2:
+            indices = torch.arange(seq_len, device=states.device, dtype=torch.long)
+        else:
+            batch_size = states.shape[0]
+            indices = torch.arange(seq_len, device=states.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        return states, indices
     
     if len(states.shape) == 2:
         # [seq_len, state_dim]
-        return states[::ratio]
+        seq_len = states.shape[0]
+        indices = torch.arange(0, seq_len-1, ratio, device=states.device, dtype=torch.long)
+        return torch.cat([states[::ratio], states[-1]], dim=0), indices
     else:
         # [batch_size, seq_len, state_dim]
-        return states[:, ::ratio, :]
+        seq_len = states.shape[1]
+        indices = torch.arange(0, seq_len-1, ratio, device=states.device, dtype=torch.long)
+        indices = torch.cat([indices, torch.tensor([seq_len-1], device=states.device, dtype=torch.long)])
+        # Expand indices for batch dimension: [batch_size, new_seq_len]
+        batch_size = states.shape[0]
+        indices = indices.unsqueeze(0).expand(batch_size, -1)
+        return torch.cat([states[:, ::ratio, :], states[:, -1, :].unsqueeze(1)], dim=1), indices
 
 
 def train_epoch_ppo(
@@ -63,6 +79,7 @@ def train_epoch_ppo(
     value_net: nn.Module,
     initial_state: torch.Tensor,
     actual_states: torch.Tensor,
+    downsampled_indices: torch.Tensor,
     actor_optimizer: optim.Optimizer,
     value_optimizer: optim.Optimizer,
     device: torch.device,
@@ -71,7 +88,7 @@ def train_epoch_ppo(
     ppo_epochs: int = 4,
     clip_epsilon: float = 0.2,
     value_coef: float = 0.5,
-    entropy_coef: float = 0.002,
+    entropy_coef: float = 0.01,  # Increased to encourage more exploration
     gamma: float = 0.99,
     use_history: bool = True,
     history_length: int = 10,
@@ -140,45 +157,75 @@ def train_epoch_ppo(
     with torch.no_grad():
         # Compute step-wise rewards for each rollout
         # Note: compute_reward can handle different sequence lengths between predicted and actual
-        step_rewards = compute_reward(predicted_states, actual_states_batch, actions=sampled_controls)  # [num_rollouts, predicted_seq_len]
+        step_rewards = compute_reward_downsampled_next(predicted_states, actual_states_batch, downsampled_indices,  actions=sampled_controls)  # [num_rollouts, predicted_seq_len]
         
-        # Compute values for all states in trajectories
+
+        
+        # Find the rollout with the best sum of step rewards
+        total_rewards_per_rollout = step_rewards.sum(dim=1)  # [num_rollouts] - sum of rewards for each rollout
+        best_rollout_idx = total_rewards_per_rollout.argmax().item()  # Index of rollout with highest total reward
+        best_rollout_trajectory = predicted_states[best_rollout_idx].detach().cpu()  # [predicted_seq_len, 4] - best rollout trajectory (moved to CPU)
+        best_rollout_reward_sum = total_rewards_per_rollout[best_rollout_idx].item()
+        
+        # Compute values for all states in trajectories - batched for GPU efficiency
         # Flatten for batch processing: [num_rollouts * predicted_seq_len]
         states_flat = predicted_states.reshape(-1, 4)  # [num_rollouts * predicted_seq_len, 4]
-        actual_traj_flat = actual_states_batch.repeat_interleave(predicted_seq_len, dim=0)  # [num_rollouts * predicted_seq_len, actual_seq_len, 4]
+        # Prepare time indices for value network evaluation
+        time_indices_flat = torch.arange(predicted_seq_len, device=device, dtype=torch.long).repeat(num_rollouts)  # [num_rollouts * predicted_seq_len]
         
-        old_values = value_net(actual_traj_flat, states_flat).squeeze(-1)  # [num_rollouts * predicted_seq_len]
-        old_values = old_values.reshape(num_rollouts, predicted_seq_len)  # [num_rollouts, predicted_seq_len]
+        # Batch value network evaluation with adaptive batch size to avoid OOM
+        total_states = num_rollouts * predicted_seq_len
+        value_batch_size = min(512, total_states)  # Larger batch size for value network
+        old_values_list = []
         
-        # Compute returns using discounted cumulative rewards (backward from end)
-        # For PPO, we compute returns as discounted sum of future rewards
+        for batch_start in range(0, total_states, value_batch_size):
+            batch_end = min(batch_start + value_batch_size, total_states)
+            batch_slice = slice(batch_start, batch_end)
+            batch_values = value_net(
+                states_flat[batch_slice],
+                current_time_index=time_indices_flat[batch_slice]
+            ).squeeze(-1)  # [batch_size]
+            old_values_list.append(batch_values)
+        
+        old_values = torch.cat(old_values_list, dim=0).reshape(num_rollouts, predicted_seq_len)  # [num_rollouts, predicted_seq_len]
+        
+        # Compute returns using vectorized approach: Returns[t] = reward[t] + gamma * Returns[t+1]
+        # Work backwards from the end, but vectorize across rollouts
         returns = torch.zeros_like(step_rewards)  # [num_rollouts, predicted_seq_len]
         returns[:, -1] = step_rewards[:, -1]  # Last step return is just its reward
         
-        # Compute discounted returns backwards
+        # Vectorized backward pass: for each time step, compute in parallel across rollouts
+        # We still need to iterate backwards, but each iteration processes all rollouts at once
         for t in range(predicted_seq_len - 2, -1, -1):
             returns[:, t] = step_rewards[:, t] + gamma * returns[:, t + 1]
         
         # Compute advantages (returns - values)
         advantages = returns - old_values  # [num_rollouts, predicted_seq_len]
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalize advantages to stabilize training and ensure consistent gradient signals
+        # This is critical for PPO to work effectively
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        if adv_std > 1e-6:  # Only normalize if std is significant
+            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+        # If std is too small, advantages are likely uniform - keep as is
         
-        # Store old log probs (sum over time steps for each rollout)
-        old_log_probs_sum = old_log_probs.sum(dim=1)  # [num_rollouts]
     
     # Prepare data for PPO updates
     # Flatten all trajectories into a single batch
     total_samples = num_rollouts * predicted_seq_len
+    
+    # Track average std for monitoring
+    total_std_sum = 0.0
+    total_std_count = 0
     
     # Repeat advantages and returns for each time step
     advantages_flat = advantages.reshape(-1)  # [num_rollouts * predicted_seq_len]
     returns_flat = returns.reshape(-1)  # [num_rollouts * predicted_seq_len]
     old_log_probs_flat = old_log_probs.reshape(-1)  # [num_rollouts * predicted_seq_len]
     
-    # Store rollout trajectories for visualization
+    # Store rollout trajectories for visualization (move to CPU asynchronously)
     num_trajectories_to_save = min(10, num_rollouts)
-    rollout_trajectories = predicted_states[:num_trajectories_to_save].detach().cpu()
+    rollout_trajectories = predicted_states[:num_trajectories_to_save].detach()  # Keep on GPU until needed
     
     # PPO update epochs
     total_actor_loss = 0.0
@@ -188,8 +235,8 @@ def train_epoch_ppo(
         # Shuffle data
         indices = torch.randperm(total_samples, device=device)
         
-        # Process in mini-batches (optional, but can help with stability)
-        batch_size = min(64, total_samples)
+        # Process in mini-batches - use larger batch size for better GPU utilization
+        batch_size = min(256, total_samples)  # Increased from 64 to 256 for better GPU utilization
         
         for batch_start in range(0, total_samples, batch_size):
             batch_end = min(batch_start + batch_size, total_samples)
@@ -197,7 +244,6 @@ def train_epoch_ppo(
             
             # Get batch data
             batch_states = states_flat[batch_indices]  # [batch_size, 4]
-            batch_actual_traj = actual_traj_flat[batch_indices]  # [batch_size, actual_seq_len, 4]
             batch_actions = sampled_controls.reshape(-1, 2)[batch_indices]  # [batch_size, 2]
             batch_advantages = advantages_flat[batch_indices]  # [batch_size]
             batch_returns = returns_flat[batch_indices]  # [batch_size]
@@ -205,17 +251,27 @@ def train_epoch_ppo(
             
             # Get current policy log probs and values
             # Need to recompute log probs for the same actions
-            # Note: We don't have action_history here, so pass None (model will use zeros)
-            mean, log_std = actor.forward(batch_actual_traj, batch_states, action_history=None)
+            # Get time indices for batch states (from the flattened indices)
+            # batch_indices correspond to positions in the flattened [num_rollouts * predicted_seq_len] array
+            # Convert to (rollout_idx, time_idx) pairs
+            time_indices = batch_indices % predicted_seq_len  # Which time step in that rollout
+            batch_time_indices = time_indices.long()  # [batch_size]
+
+            mean, log_std = actor.forward(batch_states, current_time_index=batch_time_indices)
             std = torch.exp(log_std)
-            std = torch.clamp(std, min=1e-6, max=10.0)
+            # Clamp std to reasonable bounds: min=0.01 (maintains exploration), max=10.0 (prevents extreme actions)
+            std = torch.clamp(std, min=0.01, max=10.0)
+            
+            # Track average std for monitoring
+            total_std_sum += std.mean().item()
+            total_std_count += 1
             
             # Compute log prob for the stored actions
             normal = Normal(mean, std)
             new_log_probs = normal.log_prob(batch_actions).sum(dim=1)  # [batch_size]
             
             # Compute value estimates
-            new_values = value_net(batch_actual_traj, batch_states).squeeze(-1)  # [batch_size]
+            new_values = value_net(batch_states, current_time_index=batch_time_indices).squeeze(-1)  # [batch_size]
             
             # Compute ratio for PPO
             ratio = torch.exp(new_log_probs - batch_old_log_probs)  # [batch_size]
@@ -225,27 +281,46 @@ def train_epoch_ppo(
             surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * batch_advantages
             actor_loss = -torch.min(surr1, surr2).mean()
             
-            # Value loss
-            value_loss = torch.nn.functional.mse_loss(new_values, batch_returns)
+            # Value loss: use MSE loss to learn the actual return scale
+            # DO NOT normalize by returns variance - this prevents learning the true reward scale
+            # The value function should predict actual returns (around -22.6), not normalized returns
+            # Normalizing by variance makes the loss scale-invariant, which can cause the value function
+            # to converge to a suboptimal solution where rewards don't improve
+            # Weight the MSE loss by the (shifted) returns so higher returns have higher weight
+            # Normalize weights to sum to 1 for stability
+            mean_return = batch_returns.mean()
+            std_return = batch_returns.std()
+            weights = batch_returns - mean_return + 1e-4  # shift so weights are >= 0
+            weights = weights / std_return  # normalize
+            weights = torch.softmax(weights, dim=0)  # normalize
+            value_loss = torch.nn.functional.mse_loss(new_values, batch_returns, reduction='none')
+            value_loss = (value_loss * weights).sum()
             
             # Entropy bonus (encourage exploration)
             entropy = normal.entropy().sum(dim=1).mean()  # [batch_size] -> scalar
-            entropy_bonus = -entropy_coef * entropy
+            
+            # Minimum entropy constraint: ensure policy maintains some exploration
+            # If entropy is too low, add a penalty to encourage higher variance
+            action_dim = mean.shape[1] if len(mean.shape) > 1 else mean.shape[0]  # Get action_dim from mean shape
+            min_entropy = action_dim * 0.5  # Minimum entropy per action dimension (roughly std ≈ 0.5)
+            entropy_penalty = torch.clamp(min_entropy - entropy, min=0.0) * 0.1  # Penalty if entropy too low
+            
+            entropy_bonus = -entropy_coef * entropy - entropy_penalty
             
             # Total actor loss
             total_actor_loss_batch = actor_loss + entropy_bonus
             
-            # Update actor
-            actor_optimizer.zero_grad()
+            # Compute gradients (update after each batch for stability, but reduce optimizer overhead)
             total_actor_loss_batch.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)
             actor_optimizer.step()
+            actor_optimizer.zero_grad()
             
             # Update value network
-            value_optimizer.zero_grad()
             value_loss.backward()
             torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=0.5)
             value_optimizer.step()
+            value_optimizer.zero_grad()
             
             total_actor_loss += actor_loss.item()
             total_value_loss += value_loss.item()
@@ -254,6 +329,8 @@ def train_epoch_ppo(
     num_batches = ppo_epochs * (total_samples // batch_size + (1 if total_samples % batch_size > 0 else 0))
     avg_actor_loss = total_actor_loss / num_batches if num_batches > 0 else 0.0
     avg_value_loss = total_value_loss / num_batches if num_batches > 0 else 0.0
+    
+
     
     # Normalize losses by sequence length to make them per-timestep
     # This makes losses comparable across different sequence lengths
@@ -266,10 +343,11 @@ def train_epoch_ppo(
     
     avg_loss = normalized_actor_loss + value_coef * normalized_value_loss
     
-    return avg_loss, rollout_trajectories
+    return avg_loss, normalized_actor_loss, normalized_value_loss, rollout_trajectories,  best_rollout_trajectory, best_rollout_reward_sum
 
 
 def main():
+    t
     parser = argparse.ArgumentParser(
         description='Train neural network control policy using reinforcement learning (PPO)'
     )
@@ -296,6 +374,13 @@ def main():
         type=int,
         default=10,
         help='Save checkpoint every N epochs'
+    )
+    parser.add_argument(
+        '--downsample_ratio',
+        type=int,
+        default=10,
+        help='Downsample ratio for actual states during training (default: 1, no downsampling). '
+             'If > 1, every Nth state is kept. Complete trajectory is used for evaluation and visualization.'
     )
     
     args = parser.parse_args()
@@ -387,10 +472,13 @@ def main():
     # Downsample actual_states for training if specified
     # The reward function can handle different sequence lengths without time alignment
     if args.downsample_ratio > 1:
-        actual_states = downsample_states(actual_states_complete, args.downsample_ratio)
+        actual_states, downsampled_indices = downsample_states(actual_states_complete, args.downsample_ratio)
         print(f"Downsampling actual states: {actual_states_complete.shape[1]} -> {actual_states.shape[1]} (ratio={args.downsample_ratio})")
     else:
         actual_states = actual_states_complete
+        seq_len = actual_states_complete.shape[1]
+        batch_size = actual_states_complete.shape[0]
+        downsampled_indices = torch.arange(seq_len, device=actual_states_complete.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
     
     print(f"Initial State after normalization: {initial_state[0,:]}")
     if len(states) > 1:
@@ -443,6 +531,7 @@ def main():
     train_losses = []
     best_loss = float('inf')
     best_epoch = 0
+    best_rollout = float('-inf')
     
     print("\nStarting reinforcement learning training...")
     print("Using Proximal Policy Optimization (PPO) with step-wise rewards")
@@ -453,6 +542,7 @@ def main():
     # Move data to device
     initial_state = initial_state.to(device)
     actual_states = actual_states.to(device)
+    downsampled_indices = downsampled_indices.to(device)
     
     # Determine checkpoint saving strategy: save every 10 epochs OR 9 evenly spaced, whichever is fewer
     # Option 1: Save every 10 epochs
@@ -485,11 +575,12 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
         
         # Train with PPO
-        train_loss, rollout_trajectory = train_epoch_ppo(
+        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum = train_epoch_ppo(
             actor=actor,
             value_net=value_net,
             initial_state=initial_state,
             actual_states=actual_states,
+            downsampled_indices=downsampled_indices,
             actor_optimizer=actor_optimizer,
             value_optimizer=value_optimizer,
             device=device,
@@ -504,21 +595,26 @@ def main():
         )
         train_losses.append(train_loss)
         
-        print(f"Train Loss: {train_loss:.6f}")
+        print(f"Train Loss: {train_loss:.6f}, Actor Loss: {actor_loss:.6f}, Value Loss: {value_loss:.6f}, "
+              f"Best Rollout Reward Sum: {best_rollout_reward_sum:.6f}")
         
         # Track best model (minimum training loss)
-        if train_loss < best_loss:
-            best_loss = train_loss
+        if best_rollout_reward_sum > best_rollout:
+            best_rollout = best_rollout_reward_sum
+            
             best_epoch = epoch + 1
             # Save best model checkpoint
             best_checkpoint = {
                 'epoch': best_epoch,
                 'actor_state_dict': actor.state_dict(),
+                'downsampled_indices': downsampled_indices,
                 'value_net_state_dict': value_net.state_dict(),
                 'actor_optimizer_state_dict': actor_optimizer.state_dict(),
                 'value_optimizer_state_dict': value_optimizer.state_dict(),
                 'train_loss': best_loss,
                 'rollout_trajectories': rollout_trajectory,  # [num_trajectories, seq_len, 4] - normalized states
+                'best_rollout_trajectory': best_rollout_trajectory,  # [seq_len, 4] - normalized states
+                'best_rollout_reward_sum': best_rollout_reward_sum,
                 'hidden_dim': args.hidden_dim,
                 'num_layers': args.num_layers,
                 'dropout': args.dropout
@@ -531,11 +627,14 @@ def main():
             checkpoint = {
                 'epoch': epoch + 1,
                 'actor_state_dict': actor.state_dict(),
+                'downsampled_indices': downsampled_indices,
                 'value_net_state_dict': value_net.state_dict(),
                 'actor_optimizer_state_dict': actor_optimizer.state_dict(),
                 'value_optimizer_state_dict': value_optimizer.state_dict(),
                 'train_loss': train_loss,
                 'rollout_trajectories': rollout_trajectory,  # [num_trajectories, seq_len, 4] - normalized states
+                'best_rollout_trajectory': best_rollout_trajectory,  # [seq_len, 4] - normalized states
+                'best_rollout_reward_sum': best_rollout_reward_sum,
                 'hidden_dim': args.hidden_dim,
                 'num_layers': args.num_layers,
                 'dropout': args.dropout
@@ -552,24 +651,44 @@ def main():
         actual_states_batch = actual_states.repeat(10, 1, 1)  # [10, seq_len, 4]
         
         # Use stochastic policy (sampling) for final rollouts to get diverse trajectories
-        final_rollout_trajectories, _, _ = rollout_trajectory_state_feedback(
+        # Expand downsampled_indices for batch
+        if downsampled_indices.shape[0] == 1:
+            downsampled_indices_batch = downsampled_indices.expand(10, -1)
+        else:
+            downsampled_indices_batch = downsampled_indices[:10]  # Take first 10 if multiple
+        
+        final_predicted_states, final_sampled_controls, _ = rollout_trajectory_state_feedback(
             actor=actor,
             initial_state=initial_state_batch,
             actual_trajectory=actual_states_batch,
             seq_len=actual_states_complete.shape[1],
             dt=args.dt
         )
-        final_rollout_trajectories = final_rollout_trajectories.detach().cpu()  # [10, seq_len, 4]
+        final_rollout_trajectories = final_predicted_states.detach().cpu()  # [10, seq_len, 4]
+        
+        # Compute step rewards for final rollouts to find the best one
+        final_step_rewards = compute_reward_downsampled_next(
+            final_predicted_states, actual_states_batch, downsampled_indices_batch, actions=final_sampled_controls
+        )  # [10, predicted_seq_len]
+        
+        # Find best rollout
+        final_total_rewards = final_step_rewards.sum(dim=1)  # [10]
+        final_best_rollout_idx = final_total_rewards.argmax().item()
+        final_best_rollout_trajectory = final_rollout_trajectories[final_best_rollout_idx]  # [seq_len, 4] (already on CPU)
+        final_best_rollout_reward_sum = final_total_rewards[final_best_rollout_idx].item()
     
     # Save final model with rollout trajectories
     final_checkpoint = {
         'epoch': args.num_epochs,
         'actor_state_dict': actor.state_dict(),
+        'downsampled_indices': downsampled_indices,
         'value_net_state_dict': value_net.state_dict(),
         'actor_optimizer_state_dict': actor_optimizer.state_dict(),
         'value_optimizer_state_dict': value_optimizer.state_dict(),
         'train_loss': train_losses[-1],
         'rollout_trajectories': final_rollout_trajectories,  # [10, seq_len, 4] - normalized states
+        'best_rollout_trajectory': final_best_rollout_trajectory,  # [seq_len, 4] - normalized states
+        'best_rollout_reward_sum': final_best_rollout_reward_sum,
         'hidden_dim': args.hidden_dim,
         'num_layers': args.num_layers,
         'dropout': args.dropout
@@ -632,6 +751,7 @@ def main():
         output_dir=output_dir,
         num_epochs=args.num_epochs,
         algorithm_name="PPO",
+        environment_name="vehicle",
         dt=args.dt,
         actual_states_downsampled=actual_states_downsampled_np
     )

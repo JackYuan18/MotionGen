@@ -86,7 +86,7 @@ def add_ppo_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser.add_argument(
         '--entropy_coef',
         type=float,
-        default=0.02,
+        default=0.085,
         help='Coefficient for entropy bonus'
     )
     parser.add_argument(

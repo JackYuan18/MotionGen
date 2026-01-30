@@ -158,3 +158,108 @@ def compute_reward(
     )  # [batch_size, seq_len_pred]
     
     return state_rewards
+
+
+def compute_reward_downsampled_next(
+    predicted_states: torch.Tensor,
+    downsampled_states: torch.Tensor,
+    downsampled_indices: torch.Tensor,
+    actions: torch.Tensor = None,
+    action_norm_weight: float = 0.001,
+    distance_weight: float = 10.0
+) -> torch.Tensor:
+    """
+    Compute step-wise rewards based on distance toward the next downsampled state.
+    
+    For each predicted state at time index t:
+    1. Find the downsampled state with the smallest time index larger than t
+    2. Compute the distance toward that next downsampled state
+    3. Reward is negative distance (closer to next target = higher reward)
+    
+    This encourages the policy to progress forward through the downsampled waypoints.
+    
+    Args:
+        predicted_states: [batch_size, seq_len_pred, 4] predicted trajectory states
+                         Each state at position i has time index i (0, 1, 2, ...)
+        downsampled_states: [batch_size, seq_len_downsampled, 4] downsampled actual states
+        downsampled_indices: [batch_size, seq_len_downsampled] original time indices of downsampled states
+        actions: [batch_size, seq_len_pred, 2] actions/controls applied at each time step
+                 If None, action penalties are not included
+        action_smoothness_weight: Weight for action smoothness penalty (default: 0.01)
+        action_norm_weight: Weight for action norm penalty (default: 0.01)
+        distance_weight: Weight for distance to next downsampled state (default: 10.0)
+    
+    Returns:
+        Step-wise rewards [batch_size, seq_len_pred] (higher is better)
+    """
+    batch_size, seq_len_pred, state_dim = predicted_states.shape
+    _, seq_len_downsampled, _ = downsampled_states.shape
+    
+    # Expand downsampled_indices and downsampled_states to match batch_size if needed
+    if downsampled_indices.shape[0] == 1 and batch_size > 1:
+        downsampled_indices = downsampled_indices.expand(batch_size, -1)
+    if downsampled_states.shape[0] == 1 and batch_size > 1:
+        downsampled_states = downsampled_states.expand(batch_size, -1, -1)
+    
+    # Vectorized computation: For each predicted state at time index t, find the next downsampled state
+    # Create time indices for all predicted states: [batch_size, seq_len_pred]
+    time_indices = torch.arange(seq_len_pred, device=predicted_states.device, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len_pred]
+    
+    # Expand downsampled_indices for broadcasting: [batch_size, seq_len_pred, seq_len_downsampled]
+    # For each predicted time t, compare with all downsampled time indices
+    downsampled_indices_expanded = downsampled_indices.unsqueeze(1)  # [batch_size, 1, seq_len_downsampled]
+    time_indices_expanded = time_indices.unsqueeze(2)  # [batch_size, seq_len_pred, 1]
+    
+    # Find next downsampled states: mask where downsampled_indices > t
+    next_mask = downsampled_indices_expanded > time_indices_expanded  # [batch_size, seq_len_pred, seq_len_downsampled]
+    
+    # Get next time indices (smallest time index > t for each (b, t))
+    # Set invalid (no next state) to a very large value (use max value of dtype instead of inf)
+    # Handle both integer and float types
+    if downsampled_indices_expanded.dtype.is_floating_point:
+        max_value = torch.finfo(downsampled_indices_expanded.dtype).max
+    else:
+        max_value = torch.iinfo(downsampled_indices_expanded.dtype).max
+    next_time_indices = torch.where(next_mask, downsampled_indices_expanded, torch.full_like(downsampled_indices_expanded, max_value))
+    next_time_idx_values, next_time_idx_positions = next_time_indices.min(dim=2)  # [batch_size, seq_len_pred]
+    
+    # Check if there's a valid next state (not max_value)
+    has_next = next_time_idx_values < max_value
+    
+    # Get next target states using advanced indexing
+    # For positions where has_next is True, use next_time_idx_positions; otherwise use -1 (last state)
+    target_indices = torch.where(has_next, next_time_idx_positions, torch.full_like(next_time_idx_positions, seq_len_downsampled - 1, dtype=torch.long))
+    
+    # Use batch indexing to get target states: [batch_size, seq_len_pred, 4]
+    batch_indices = torch.arange(batch_size, device=predicted_states.device).unsqueeze(1).expand(-1, seq_len_pred)
+    next_target_states = downsampled_states[batch_indices, target_indices]  # [batch_size, seq_len_pred, 4]
+    
+    # Compute state differences: [batch_size, seq_len_pred, 4]
+    state_diff = predicted_states - next_target_states
+    
+    # Wrap heading difference (index 2) for all states at once
+    heading_diff = state_diff[:, :, 2]
+    state_diff[:, :, 2] = torch.atan2(torch.sin(heading_diff), torch.cos(heading_diff))*2
+    
+    # Compute distances: [batch_size, seq_len_pred]
+    next_target_distances = torch.norm(state_diff, dim=2)
+    
+    # Part 2: Action penalties (optional)
+    action_norm = torch.zeros(batch_size, seq_len_pred, device=predicted_states.device)
+    
+    if actions is not None:
+        # Action smoothness: difference between consecutive actions
+        prev_actions = torch.zeros_like(actions)
+        prev_actions[:, 1:, :] = actions[:, :-1, :]
+        
+        # Action norm: magnitude of actions (reduced penalty for first action)
+        action_norm = torch.norm(actions, dim=2)  # [batch_size, seq_len_pred]
+        action_norm[:, 0] = action_norm[:, 0] * 0.1
+    
+    # Combine all components (negative distance because we maximize reward = minimize distance)
+    state_rewards = -(
+        distance_weight * next_target_distances
+        + action_norm_weight * action_norm
+    )  # [batch_size, seq_len_pred]
+    
+    return state_rewards
