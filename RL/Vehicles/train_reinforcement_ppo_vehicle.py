@@ -152,7 +152,7 @@ def train_epoch_ppo(
     
     # Get the actual sequence length from predicted_states (may differ from actual_states due to dt)
     predicted_seq_len = predicted_states.shape[1]
-    actual_seq_len = actual_states_batch.shape[1]
+
     
     with torch.no_grad():
         # Compute step-wise rewards for each rollout
@@ -166,6 +166,7 @@ def train_epoch_ppo(
         best_rollout_idx = total_rewards_per_rollout.argmax().item()  # Index of rollout with highest total reward
         best_rollout_trajectory = predicted_states[best_rollout_idx].detach().cpu()  # [predicted_seq_len, 4] - best rollout trajectory (moved to CPU)
         best_rollout_reward_sum = total_rewards_per_rollout[best_rollout_idx].item()
+        best_rollout_controls = sampled_controls[best_rollout_idx].detach().cpu()  # [predicted_seq_len, 2] - best rollout controls (moved to CPU)
         
         # Compute values for all states in trajectories - batched for GPU efficiency
         # Flatten for batch processing: [num_rollouts * predicted_seq_len]
@@ -343,7 +344,7 @@ def train_epoch_ppo(
     
     avg_loss = normalized_actor_loss + value_coef * normalized_value_loss
     
-    return avg_loss, normalized_actor_loss, normalized_value_loss, rollout_trajectories,  best_rollout_trajectory, best_rollout_reward_sum
+    return avg_loss, normalized_actor_loss, normalized_value_loss, rollout_trajectories,  best_rollout_trajectory, best_rollout_reward_sum, best_rollout_controls
 
 
 def main():
@@ -575,7 +576,7 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
         
         # Train with PPO
-        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum = train_epoch_ppo(
+        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum, best_rollout_controls = train_epoch_ppo(
             actor=actor,
             value_net=value_net,
             initial_state=initial_state,
@@ -615,6 +616,7 @@ def main():
                 'rollout_trajectories': rollout_trajectory,  # [num_trajectories, seq_len, 4] - normalized states
                 'best_rollout_trajectory': best_rollout_trajectory,  # [seq_len, 4] - normalized states
                 'best_rollout_reward_sum': best_rollout_reward_sum,
+                'best_rollout_controls': best_rollout_controls,
                 'hidden_dim': args.hidden_dim,
                 'num_layers': args.num_layers,
                 'dropout': args.dropout
@@ -635,6 +637,7 @@ def main():
                 'rollout_trajectories': rollout_trajectory,  # [num_trajectories, seq_len, 4] - normalized states
                 'best_rollout_trajectory': best_rollout_trajectory,  # [seq_len, 4] - normalized states
                 'best_rollout_reward_sum': best_rollout_reward_sum,
+                'best_rollout_controls': best_rollout_controls,
                 'hidden_dim': args.hidden_dim,
                 'num_layers': args.num_layers,
                 'dropout': args.dropout

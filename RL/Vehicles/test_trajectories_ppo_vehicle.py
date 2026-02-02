@@ -143,7 +143,7 @@ def train_and_evaluate_trajectory(
     
     # Training loop
     for epoch in range(args.num_epochs):
-        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum = train_epoch_ppo(
+        train_loss, actor_loss, value_loss, rollout_trajectory, best_rollout_trajectory, best_rollout_reward_sum, best_rollout_controls = train_epoch_ppo(
             actor=actor,
             value_net=value_net,
             initial_state=initial_state,
@@ -226,6 +226,23 @@ def train_and_evaluate_trajectory(
     predicted_trajectory_denorm = predicted_states_np * state_std + state_mean
     predicted_trajectory = predicted_trajectory_denorm.tolist()
     
+    # Convert tensors to lists for JSON serialization
+    if isinstance(downsampled_indices, torch.Tensor):
+        downsampled_indices_list = downsampled_indices.cpu().numpy().tolist()
+    else:
+        downsampled_indices_list = downsampled_indices.tolist() if hasattr(downsampled_indices, 'tolist') else downsampled_indices
+    
+    # Convert best_rollout_controls to list
+    if best_rollout_controls is not None:
+        if isinstance(best_rollout_controls, torch.Tensor):
+            best_rollout_controls_list = best_rollout_controls.cpu().numpy().tolist()
+        elif isinstance(best_rollout_controls, np.ndarray):
+            best_rollout_controls_list = best_rollout_controls.tolist()
+        else:
+            best_rollout_controls_list = best_rollout_controls
+    else:
+        best_rollout_controls_list = None
+    
     return {
         'trajectory_index': traj_idx,
         'best_loss': best_loss,
@@ -235,7 +252,9 @@ def train_and_evaluate_trajectory(
         'final_loss': train_losses[-1] if train_losses else float('inf'),
         'actual_trajectory_complete': actual_trajectory_complete,
         'actual_trajectory_downsampled': actual_trajectory_downsampled,
+        'Downsampled_indices': downsampled_indices_list,
         'predicted_trajectory': predicted_trajectory,
+        'best_rollout_controls': best_rollout_controls_list,
         'downsample_ratio': downsample_ratio
     }
 
