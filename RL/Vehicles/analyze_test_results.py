@@ -28,14 +28,18 @@ def compute_mse(predicted: np.ndarray, actual: np.ndarray) -> float:
         MSE (scalar)
     """
     # Use position (x, y) for MSE calculation
-    mse = np.mean((predicted[:, :2] - actual[:, :2]) ** 2)
-    return float(mse)
+    seq_len_pred = predicted.shape[0]
+    seq_len_actual = actual.shape[0]
+    min_len = min(seq_len_pred, seq_len_actual)
+    # Compute MSE for overlapping portion
+    norm = np.linalg.norm((predicted[:min_len, :2] - actual[:min_len, :2]), axis=1)
 
+    return np.mean(norm) + np.linalg.norm((predicted[-1, :2] - actual[-1, :2]))*(float(seq_len_pred > seq_len_actual))
 
 def compute_waypoint_error(
     predicted: np.ndarray,
     actual_downsampled: np.ndarray,
-    downsample_ratio: int
+    downsampled_indices: np.ndarray
 ) -> float:
     """
     Compute average waypoint error between generated states and downsampled states
@@ -44,7 +48,7 @@ def compute_waypoint_error(
     Args:
         predicted: [seq_len, 4] predicted trajectory states
         actual_downsampled: [downsampled_seq_len, 4] downsampled actual trajectory states
-        downsample_ratio: Ratio used for downsampling
+        downsampled_indices: Array of indices where waypoints are located in the complete trajectory
     
     Returns:
         Average waypoint error (scalar)
@@ -52,29 +56,28 @@ def compute_waypoint_error(
     if actual_downsampled is None or len(actual_downsampled) == 0:
         return float('nan')
     
-    num_waypoints = len(actual_downsampled)
+    if downsampled_indices is None or len(downsampled_indices) == 0:
+        return float('nan')
     
-    # Get indices where waypoints are located
-    # If downsample_ratio is R, waypoints are at indices: 0, R, 2R, 3R, ...
-    # But we need to handle cases where predicted trajectory might be shorter or longer
-    if downsample_ratio > 1:
-        waypoint_indices = np.arange(0, min(len(predicted), num_waypoints * downsample_ratio), downsample_ratio)
-    else:
-        # No downsampling, compare all points
-        waypoint_indices = np.arange(0, min(len(predicted), num_waypoints))
+    # Convert to numpy array if needed
+    if not isinstance(downsampled_indices, np.ndarray):
+        downsampled_indices = np.array(downsampled_indices)
     
-    # Limit to available waypoints
-    waypoint_indices = waypoint_indices[:num_waypoints]
-    num_valid_waypoints = len(waypoint_indices)
+    # Ensure indices are within bounds of predicted trajectory
+    valid_mask = (downsampled_indices >= 0) & (downsampled_indices < len(predicted))
+    waypoint_indices = downsampled_indices[valid_mask]
     
-    if num_valid_waypoints == 0:
+    # Limit to available waypoints (should match length of actual_downsampled)
+    num_waypoints = min(len(waypoint_indices), len(actual_downsampled))
+    
+    if num_waypoints == 0:
         return float('nan')
     
     # Extract predicted states at waypoint indices
-    predicted_at_waypoints = predicted[waypoint_indices]
+    predicted_at_waypoints = predicted[waypoint_indices[:num_waypoints]]
     
-    # Compare with actual downsampled states (only up to num_valid_waypoints)
-    actual_at_waypoints = actual_downsampled[:num_valid_waypoints]
+    # Compare with actual downsampled states (only up to num_waypoints)
+    actual_at_waypoints = actual_downsampled[:num_waypoints]
     
     # Compute position error (x, y) at waypoints
     errors = np.linalg.norm(predicted_at_waypoints[:, :2] - actual_at_waypoints[:, :2], axis=1)
@@ -83,7 +86,7 @@ def compute_waypoint_error(
     return float(avg_error)
 
 
-def compute_jerk_magnitude(states: np.ndarray, dt: float = 0.1) -> float:
+def compute_jerk_acceleration_velocity_magnitude(states: np.ndarray, dt: float = 0.1) -> float:
     """
     Compute average square root of jerk (jerk magnitude) of the trajectory states.
     
@@ -123,123 +126,16 @@ def compute_jerk_magnitude(states: np.ndarray, dt: float = 0.1) -> float:
     jy = np.gradient(ay) / dt
     
     # Compute jerk magnitude: sqrt(jx² + jy²)
-    jerk_magnitude = np.sqrt(jx**2 + jy**2)
-    
+    jerk_magnitudes = np.sqrt(jx**2 + jy**2)
+    acceleration_magnitudes= np.linalg.norm(np.column_stack([ax, ay]), axis=1)
+    velocity_magnitudes = np.linalg.norm(np.column_stack([vx, vy]), axis=1)
     # Return average jerk magnitude
-    avg_jerk_magnitude = np.mean(jerk_magnitude)
     
-    return float(avg_jerk_magnitude)
-
-
-def compute_actions_from_states(states: np.ndarray, dt: float = 0.1) -> np.ndarray:
-    """
-    Compute control actions from state sequence.
-    
-    For vehicle model: control = [acceleration, angular_velocity]
-    
-    Args:
-        states: [seq_len, 4] trajectory states [x, y, θ, v]
-        dt: Time step (default: 0.1 seconds)
-    
-    Returns:
-        Actions [seq_len, 2] where actions = [a, ω]
-    """
-    if len(states) < 2:
-        return np.zeros((len(states), 2), dtype=np.float32)
-    
-    # Extract components
-    theta = states[:, 2]
-    v = states[:, 3]
-    
-    # Compute acceleration: a = dv/dt
-    dv = np.gradient(v) / dt
-    acceleration = dv
-    
-    # Compute angular velocity: ω = dθ/dt
-    # Handle angle wrapping
-    dtheta = np.diff(theta)
-    # Wrap angles to [-π, π]
-    dtheta = np.arctan2(np.sin(dtheta), np.cos(dtheta))
-    dtheta = np.concatenate([[dtheta[0]], dtheta])  # Repeat first for first point
-    angular_velocity = dtheta / dt
-    
-    actions = np.column_stack([acceleration, angular_velocity])
-    
-    return actions
-
-
-def compute_mean_action_magnitude(states: np.ndarray, dt: float = 0.1) -> float:
-    """
-    Compute mean action magnitude from trajectory states.
-    
-    Args:
-        states: [seq_len, 4] trajectory states [x, y, θ, v]
-        dt: Time step (default: 0.1 seconds)
-    
-    Returns:
-        Mean action magnitude (scalar)
-    """
-    actions = compute_actions_from_states(states, dt)
-    
-    # Compute magnitude: ||action|| = sqrt(a² + ω²)
-    action_magnitudes = np.linalg.norm(actions, axis=1)
-    
-    # Return mean magnitude
-    mean_magnitude = np.mean(action_magnitudes)
-    
-    return float(mean_magnitude)
-
-
-def analyze_trajectory(trajectory_data: Dict, dt: float = 0.1) -> Dict:
-    """
-    Analyze a single trajectory and compute all metrics.
-    
-    Args:
-        trajectory_data: Dictionary containing trajectory data from JSON
-        dt: Time step (default: 0.1 seconds)
-    
-    Returns:
-        Dictionary with computed metrics
-    """
-    # Extract data
-    traj_idx = trajectory_data.get('trajectory_index', -1)
-    predicted_trajectory = np.array(trajectory_data.get('predicted_trajectory', []))
-    actual_trajectory_complete = np.array(trajectory_data.get('actual_trajectory_complete', []))
-    actual_trajectory_downsampled = trajectory_data.get('actual_trajectory_downsampled')
-    downsample_ratio = trajectory_data.get('downsample_ratio', 1)
-    
-    if actual_trajectory_downsampled is not None:
-        actual_trajectory_downsampled = np.array(actual_trajectory_downsampled)
-    
-    # Check if we have valid data
-    if len(predicted_trajectory) == 0 or len(actual_trajectory_complete) == 0:
-        return {
-            'trajectory_index': traj_idx,
-            'mse': float('nan'),
-            'waypoint_error': float('nan'),
-            'avg_jerk_magnitude': float('nan'),
-            'avg_jerk_magnitude_actual': float('nan'),
-            'mean_action_magnitude': float('nan')
-        }
-    
-    # Compute metrics
-    mse = compute_mse(predicted_trajectory, actual_trajectory_complete)
-    waypoint_error = compute_waypoint_error(
-        predicted_trajectory,
-        actual_trajectory_downsampled,
-        downsample_ratio
-    )
-    avg_jerk_magnitude = compute_jerk_magnitude(predicted_trajectory, dt)
-    avg_jerk_magnitude_actual = compute_jerk_magnitude(actual_trajectory_complete, dt)
-    mean_action_magnitude = compute_mean_action_magnitude(predicted_trajectory, dt)
     
     return {
-        'trajectory_index': traj_idx,
-        'mse': mse,
-        'waypoint_error': waypoint_error,
-        'avg_jerk_magnitude': avg_jerk_magnitude,
-        'avg_jerk_magnitude_actual': avg_jerk_magnitude_actual,
-        'mean_action_magnitude': mean_action_magnitude
+        'velocity_magnitudes': velocity_magnitudes,
+        'acceleration_magnitudes': acceleration_magnitudes,
+        'jerk_magnitudes': jerk_magnitudes,
     }
 
 
@@ -270,6 +166,93 @@ def analyze_json_file(json_path: Path, dt: float = 0.1) -> List[Dict]:
     return results
 
 
+def analyze_trajectory(trajectory_data: Dict, dt: float = 0.1) -> Dict:
+    """
+    Analyze a single trajectory and compute all metrics.
+    
+    Args:
+        trajectory_data: Dictionary containing trajectory data from JSON for one downsampled
+        dt: Time step (default: 0.1 seconds)
+    
+    Returns:
+        Dictionary with computed metrics
+    """
+    # Extract data
+    traj_idx = trajectory_data.get('trajectory_index', -1)
+    predicted_trajectory = np.array(trajectory_data.get('predicted_trajectory', []))
+    actual_trajectory_complete = np.array(trajectory_data.get('actual_trajectory_complete', []))
+    actual_trajectory_downsampled = trajectory_data.get('actual_trajectory_downsampled')
+    downsampled_indices = trajectory_data.get('Downsampled_indices', None)
+
+    
+    if actual_trajectory_downsampled is not None:
+        actual_trajectory_downsampled = np.array(actual_trajectory_downsampled)
+    
+    # Convert downsampled_indices to numpy array if available
+    if downsampled_indices is not None:
+        if not isinstance(downsampled_indices, np.ndarray):
+            downsampled_indices = np.array(downsampled_indices)
+    
+    # Check if we have valid data
+    if len(predicted_trajectory) == 0 or len(actual_trajectory_complete) == 0:
+        return {
+            'trajectory_index': traj_idx,
+            'mse': float('nan'),
+            'waypoint_error': float('nan'),
+
+            'avg_jerk_magnitude_predicted': float('nan'),
+            'std_jerk_magnitudes_predicted': float('nan'),
+            'max_jerk_predicted': float('nan'),
+            
+            'avg_jerk_magnitude_actual': float('nan'),
+            'std_jerk_magnitudes_actual': float('nan'),
+            'max_jerk_actual': float('nan'),
+            
+            'avg_velocity_magnitudes_predicted': float('nan'),
+            'std_velocity_magnitudes_predicted': float('nan'),
+            'max_velocity_predicted': float('nan'),
+
+            'avg_acceleration_magnitudes_predicted': float('nan'),
+            'std_acceleration_magnitudes_predicted': float('nan'),
+            'max_acceleration_predicted': float('nan')      
+            
+        }
+    
+    # Compute metrics
+    mse = compute_mse(predicted_trajectory, actual_trajectory_complete)
+    waypoint_error = compute_waypoint_error(
+        predicted_trajectory,
+        actual_trajectory_downsampled,
+        downsampled_indices
+    )
+    
+    
+    # Compute velocity and acceleration statistics for predicted trajectory
+    predicted_stats = compute_jerk_acceleration_velocity_magnitude(predicted_trajectory, dt)
+    
+    # Compute velocity and acceleration statistics for actual trajectory
+    actual_stats = compute_jerk_acceleration_velocity_magnitude(actual_trajectory_complete, dt)
+
+    
+    return {
+        'trajectory_index': traj_idx,
+        'mse': mse,
+        'waypoint_error': waypoint_error,
+
+        'velocity_magnitudes_predicted': predicted_stats['velocity_magnitudes'],
+        'velocity_magnitudes_actual': actual_stats['velocity_magnitudes'],
+
+        'acceleration_magnitudes_predicted': predicted_stats['acceleration_magnitudes'],
+        'acceleration_magnitudes_actual': actual_stats['acceleration_magnitudes'],
+
+        'jerk_magnitudes_predicted': predicted_stats['jerk_magnitudes'],
+        'jerk_magnitudes_actual': actual_stats['jerk_magnitudes'],
+
+    }
+
+
+
+
 def print_summary(all_results: Dict[str, List[Dict]]):
     """
     Print summary statistics across all files.
@@ -284,9 +267,15 @@ def print_summary(all_results: Dict[str, List[Dict]]):
     # Collect all metrics across all files
     all_mse = []
     all_waypoint_error = []
-    all_jerk_magnitude = []
-    all_jerk_magnitude_actual = []
-    all_action_magnitude = []
+    all_jerk_magnitudes_predicted = []
+    all_jerk_magnitudes_actual = []
+ 
+    # New metrics for predicted trajectories
+    all_acceleration_magnitudes_predicted = []
+    all_acceleration_magnitudes_actual = []
+    all_velocity_magnitudes_predicted = []
+    all_velocity_magnitudes_actual = []
+    # New metrics for actual trajectories
     
     for filename, results in all_results.items():
         for result in results:
@@ -294,12 +283,24 @@ def print_summary(all_results: Dict[str, List[Dict]]):
                 all_mse.append(result['mse'])
             if not np.isnan(result['waypoint_error']):
                 all_waypoint_error.append(result['waypoint_error'])
-            if not np.isnan(result['avg_jerk_magnitude']):
-                all_jerk_magnitude.append(result['avg_jerk_magnitude'])
-            if not np.isnan(result['avg_jerk_magnitude_actual']):
-                all_jerk_magnitude_actual.append(result['avg_jerk_magnitude_actual'])
-            if not np.isnan(result['mean_action_magnitude']):
-                all_action_magnitude.append(result['mean_action_magnitude'])
+            
+            if result['velocity_magnitudes_predicted'] is not None:
+                all_velocity_magnitudes_predicted.extend(result['velocity_magnitudes_predicted'])
+            if result['velocity_magnitudes_actual'] is not None:
+                all_velocity_magnitudes_actual.extend(result['velocity_magnitudes_actual'])
+
+            if result['acceleration_magnitudes_predicted'] is not None:
+                all_acceleration_magnitudes_predicted.extend(result['acceleration_magnitudes_predicted'])
+            if result['acceleration_magnitudes_actual'] is not None:
+                all_acceleration_magnitudes_actual.extend(result['acceleration_magnitudes_actual'])
+
+            if result['jerk_magnitudes_predicted'] is not None:
+                all_jerk_magnitudes_predicted.extend(result['jerk_magnitudes_predicted'])
+            if result['jerk_magnitudes_actual'] is not None:
+                all_jerk_magnitudes_actual.extend(result['jerk_magnitudes_actual'])
+
+            
+            
     
     # Print statistics for each metric
     print(f"\nMean Square Error (MSE):")
@@ -312,7 +313,7 @@ def print_summary(all_results: Dict[str, List[Dict]]):
     else:
         print("  No valid data")
     
-    print(f"\nAverage Waypoint Error:")
+    print(f"\nWaypoint Error:")
     if all_waypoint_error:
         print(f"  Count: {len(all_waypoint_error)}")
         print(f"  Mean:  {np.mean(all_waypoint_error):.6f}")
@@ -322,35 +323,66 @@ def print_summary(all_results: Dict[str, List[Dict]]):
     else:
         print("  No valid data")
     
-    print(f"\nAverage Jerk Magnitude (Generated):")
-    if all_jerk_magnitude:
-        print(f"  Count: {len(all_jerk_magnitude)}")
-        print(f"  Mean:  {np.mean(all_jerk_magnitude):.6f}")
-        print(f"  Std:   {np.std(all_jerk_magnitude):.6f}")
-        print(f"  Min:   {np.min(all_jerk_magnitude):.6f}")
-        print(f"  Max:   {np.max(all_jerk_magnitude):.6f}")
+    
+    
+    # Print new metrics for predicted trajectories
+    print(f"\nVelocity Magnitudes (Predicted):")
+    if all_velocity_magnitudes_predicted:
+        print(f"  Count: {len(all_velocity_magnitudes_predicted)}")
+        print(f"  Mean:  {np.mean(all_velocity_magnitudes_predicted):.6f}")
+        print(f"  Std:   {np.std(all_velocity_magnitudes_predicted):.6f}")
+        print(f"  Max (abs.):   {np.max(np.abs(all_velocity_magnitudes_predicted)):.6f}")
+    else:
+        print("  No valid data")
+
+    print(f"\nVelocity Magnitudes (Actual):")
+    if all_velocity_magnitudes_actual:
+        print(f"  Count: {len(all_velocity_magnitudes_actual)}")
+        print(f"  Mean:  {np.mean(all_velocity_magnitudes_actual):.6f}")
+        print(f"  Std:   {np.std(all_velocity_magnitudes_actual):.6f}")
+        print(f"  Min:   {np.min(all_velocity_magnitudes_actual):.6f}")
+        print(f"  Max:   {np.max(all_velocity_magnitudes_actual):.6f}")
+    else:
+        print("  No valid data")
+
+    print(f"\nAccelerations Magnitudes (Predicted):")
+    if all_acceleration_magnitudes_predicted:
+        print(f"  Count: {len(all_acceleration_magnitudes_predicted)}")
+        print(f"  Mean:  {np.mean(all_acceleration_magnitudes_predicted):.6f}")
+        print(f"  Std:   {np.std(all_acceleration_magnitudes_predicted):.6f}")
+        print(f"  Max (abs.):   {np.max(np.abs(all_acceleration_magnitudes_predicted)):.6f}")
     else:
         print("  No valid data")
     
-    print(f"\nAverage Jerk Magnitude (Actual):")
-    if all_jerk_magnitude_actual:
-        print(f"  Count: {len(all_jerk_magnitude_actual)}")
-        print(f"  Mean:  {np.mean(all_jerk_magnitude_actual):.6f}")
-        print(f"  Std:   {np.std(all_jerk_magnitude_actual):.6f}")
-        print(f"  Min:   {np.min(all_jerk_magnitude_actual):.6f}")
-        print(f"  Max:   {np.max(all_jerk_magnitude_actual):.6f}")
+    print(f"\nAccelerations Magnitudes (Actual):")
+    if all_acceleration_magnitudes_actual:
+        print(f"  Count: {len(all_acceleration_magnitudes_actual)}")
+        print(f"  Mean:  {np.mean(all_acceleration_magnitudes_actual):.6f}")
+        print(f"  Std:   {np.std(all_acceleration_magnitudes_actual):.6f}")
+        print(f"  Max (abs.):   {np.max(np.abs(all_acceleration_magnitudes_actual)):.6f}")
+    else:
+        print("  No valid data")
+
+    print(f"\nJerk Magnitudes (Generated):")
+    if all_jerk_magnitudes_predicted:
+        print(f"  Count: {len(all_jerk_magnitudes_predicted)}")
+        print(f"  Mean:  {np.mean(all_jerk_magnitudes_predicted):.6f}")
+        print(f"  Std:   {np.std(all_jerk_magnitudes_predicted):.6f}")
+        print(f"  Max (abs.):   {np.max(np.abs(all_jerk_magnitudes_predicted)):.6f}")
     else:
         print("  No valid data")
     
-    print(f"\nMean Action Magnitude:")
-    if all_action_magnitude:
-        print(f"  Count: {len(all_action_magnitude)}")
-        print(f"  Mean:  {np.mean(all_action_magnitude):.6f}")
-        print(f"  Std:   {np.std(all_action_magnitude):.6f}")
-        print(f"  Min:   {np.min(all_action_magnitude):.6f}")
-        print(f"  Max:   {np.max(all_action_magnitude):.6f}")
+    print(f"\nJerk Magnitudes (Actual):")
+    if all_jerk_magnitudes_actual:
+        print(f"  Count: {len(all_jerk_magnitudes_actual)}")
+        print(f"  Mean:  {np.mean(all_jerk_magnitudes_actual):.6f}")
+        print(f"  Std:   {np.std(all_jerk_magnitudes_actual):.6f}")
+        print(f"  Max (abs.):   {np.max(np.abs(all_jerk_magnitudes_actual)):.6f}")
     else:
         print("  No valid data")
+    
+
+   
     
     # Print per-file statistics
     print("\n" + "="*80)
@@ -361,20 +393,41 @@ def print_summary(all_results: Dict[str, List[Dict]]):
         print(f"\n{filename}:")
         file_mse = [r['mse'] for r in results if not np.isnan(r['mse'])]
         file_waypoint = [r['waypoint_error'] for r in results if not np.isnan(r['waypoint_error'])]
-        file_jerk = [r['avg_jerk_magnitude'] for r in results if not np.isnan(r['avg_jerk_magnitude'])]
-        file_jerk_actual = [r['avg_jerk_magnitude_actual'] for r in results if not np.isnan(r['avg_jerk_magnitude_actual'])]
-        file_action = [r['mean_action_magnitude'] for r in results if not np.isnan(r['mean_action_magnitude'])]
         
+        file_velocity_magnitudes_predicted = [r['velocity_magnitudes_predicted'] for r in results if r['velocity_magnitudes_predicted'] is not None]
+        file_velocity_magnitudes_actual = [r['velocity_magnitudes_actual'] for r in results if r['velocity_magnitudes_actual'] is not None]
+        
+        file_acceleration_magnitudes_predicted = [r['acceleration_magnitudes_predicted'] for r in results if r['acceleration_magnitudes_predicted'] is not None]
+        file_acceleration_magnitudes_actual = [r['acceleration_magnitudes_actual'] for r in results if r['acceleration_magnitudes_actual'] is not None]
+        
+        file_jerk_magnitudes_predicted = [r['jerk_magnitudes_predicted'] for r in results if r['jerk_magnitudes_predicted'] is not None]
+        file_jerk_magnitudes_actual = [r['jerk_magnitudes_actual'] for r in results if r['jerk_magnitudes_actual'] is not None]
+
+        
+        
+        
+
+
         if file_mse:
-            print(f"  MSE: Mean={np.mean(file_mse):.6f}, Count={len(file_mse)}")
+            print(f"  MSE: Mean={np.mean(file_mse):.6f}, Std={np.std(file_mse):.6f}, Count={len(results)}")
         if file_waypoint:
-            print(f"  Waypoint Error: Mean={np.mean(file_waypoint):.6f}, Count={len(file_waypoint)}")
-        if file_jerk:
-            print(f"  Jerk Magnitude (Generated): Mean={np.mean(file_jerk):.6f}, Count={len(file_jerk)}")
-        if file_jerk_actual:
-            print(f"  Jerk Magnitude (Actual): Mean={np.mean(file_jerk_actual):.6f}, Count={len(file_jerk_actual)}")
-        if file_action:
-            print(f"  Action Magnitude: Mean={np.mean(file_action):.6f}, Count={len(file_action)}")
+            print(f"  Waypoint Error: Mean={np.mean(file_waypoint):.6f}, Std={np.std(file_waypoint):.6f}, Count={len(results)}")
+
+        if file_velocity_magnitudes_predicted:
+            print(f"  Velocity Magnitude (Predicted): Mean={np.mean(file_velocity_magnitudes_predicted):.6f}, Std={np.std(file_velocity_magnitudes_predicted):.6f}, Count={len(results)}")
+        if file_velocity_magnitudes_actual:
+            print(f"  Velocity Magnitude (Actual): Mean={np.mean(file_velocity_magnitudes_actual):.6f}, Std={np.std(file_velocity_magnitudes_actual):.6f}, Count={len(results)}")
+        
+        if file_acceleration_magnitudes_predicted:
+            print(f"  Acceleration Magnitude (Predicted): Mean={np.mean(file_acceleration_magnitudes_predicted):.6f}, Std={np.std(file_acceleration_magnitudes_predicted):.6f}, Count={len(results)}")
+        if file_acceleration_magnitudes_actual:
+            print(f"  Acceleration Magnitude (Actual): Mean={np.mean(file_acceleration_magnitudes_actual):.6f}, Std={np.std(file_acceleration_magnitudes_actual):.6f}, Count={len(results)}")
+        
+        if file_jerk_magnitudes_predicted:
+            print(f"  Jerk Magnitude (Generated): Mean={np.mean(file_jerk_magnitudes_predicted):.6f}, Std={np.std(file_jerk_magnitudes_predicted):.6f}, Count={len(results)}")
+        if file_jerk_magnitudes_actual:
+            print(f"  Jerk Magnitude (Actual): Mean={np.mean(file_jerk_magnitudes_actual):.6f}, Std={np.std(file_jerk_magnitudes_actual):.6f}, Count={len(results)}")
+        
 
 
 def main():
@@ -427,11 +480,32 @@ def main():
             print(f"\n  Trajectories analyzed: {len(results)}")
             for result in results[:5]:  # Show first 5
                 print(f"    Traj {result['trajectory_index']}: "
-                      f"MSE={result['mse']:.6f}, "
-                      f"WaypointErr={result['waypoint_error']:.6f}, "
-                      f"JerkMag={result['avg_jerk_magnitude']:.6f}, "
-                      f"JerkMagActual={result['avg_jerk_magnitude_actual']:.6f}, "
-                      f"ActionMag={result['mean_action_magnitude']:.6f}")
+                      f"\n MSE={result['mse']:.6f}, "
+                      f"\n WaypointErr={result['waypoint_error']:.6f}, "
+
+                      f"\n AvgVelPred={np.mean(result['velocity_magnitudes_predicted']):.6f}, "
+                      f"\n StdVelPred={np.std(result['velocity_magnitudes_predicted']):.6f}, "
+                      f"\n MaxVelPred={np.max(result['velocity_magnitudes_predicted']):.6f}, "
+
+                      f"\n AvgAccPred={np.mean(result['acceleration_magnitudes_predicted']):.6f}, "
+                      f"\n MaxAccPred={np.max(result['acceleration_magnitudes_predicted']):.6f}, "
+                      f"\n StdAccPred={np.std(result['acceleration_magnitudes_predicted']):.6f}, "
+
+                      f"\n AvgJerkPred={np.mean(result['jerk_magnitudes_predicted']):.6f}, "
+                      f"\n MaxJerkPred={np.max(result['jerk_magnitudes_predicted']):.6f}, "
+                      f"\n StdJerkPred={np.std(result['jerk_magnitudes_predicted']):.6f}, "
+                      
+                      f"\n AvgVelActual={np.mean(result['velocity_magnitudes_actual']):.6f}, "
+                      f"\n StdVelActual={np.std(result['velocity_magnitudes_actual']):.6f}, "
+                      f"\n MaxVelActual={np.max(result['velocity_magnitudes_actual']):.6f}, "
+
+                      f"\n AvgAccActual={np.mean(result['acceleration_magnitudes_actual']):.6f}, "
+                      f"\n StdAccActual={np.std(result['acceleration_magnitudes_actual']):.6f}, "
+                      f"\n MaxAccActual={np.max(result['acceleration_magnitudes_actual']):.6f}, "
+
+                      f"\n AvgJerkActual={np.mean(result['jerk_magnitudes_actual']):.6f}, "
+                      f"\n StdJerkActual={np.std(result['jerk_magnitudes_actual']):.6f}, "
+                      f"\n MaxJerkActual={np.max(result['jerk_magnitudes_actual']):.6f}")
             if len(results) > 5:
                 print(f"    ... and {len(results) - 5} more")
         except Exception as e:
